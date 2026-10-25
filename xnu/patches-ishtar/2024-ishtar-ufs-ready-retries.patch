@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/ishtar_ufs.c b/bsd/dev/ishtar_ufs.c
+index 14b77cc..7900d8a 100644
+--- a/bsd/dev/ishtar_ufs.c
++++ b/bsd/dev/ishtar_ufs.c
+@@ -1170,14 +1170,18 @@ ishtar_ufs_init(void)
+ 		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		printf("ISHTAR UFS: host taken over, TEST UNIT READY\n");
+-		for (int i = 0; i < 10 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		/*
++		 * 2024: some cold boots answered NOT READY (02/00/00) past the ten tries of 10 ms and the root was never found.
++		 * Up to 5 s now (50 x 100 ms), waking the device W-LUN again on every NOT READY.
++		 */
++		for (int i = 0; i < 50 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 			if ((ss.last_sense >> 16) == 0x2) {     /* NOT READY: to the UFS Device W-LUN */
+ 				su.lun = 0xd0;
+ 				int rc = ufs_scsi(ssu, sizeof(ssu), 0, false);
+ 				su.lun = 0;
+-				printf("ISHTAR UFS: device power mode active: %d\n", rc);
++				printf("ISHTAR UFS: try %d: NOT READY, device power mode active: %d\n", i, rc);
+ 			}
+-			delay(10000);
++			delay(100000);
+ 		}
+ 		printf("ISHTAR UFS: TUR %d\n", error);
+ 	}

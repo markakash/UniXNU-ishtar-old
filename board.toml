@@ -1,0 +1,108 @@
+# Xiaomi 13 Ultra (ishtar, SM8550-AB): xnu-11215 kernel (xnu/base from scripts/sync-base.py + xnu/patches-ishtar),
+# iPhone XR iOS 18.7.8 userland (Renegade). UEFI is ../uefi-ishtar (from uefi-nuwa). See PORTING.md.
+# TODO(ishtar-fdt) marks values that must be confirmed from the live FDT.
+
+[board]
+name = "ishtar"
+soc = "SM8550"
+description = "Xiaomi 13 Ultra - XNU (iOS 18)"
+kit = "ishtar"
+
+[firmware]
+config = "ishtar"
+dsc = "Platforms/Xiaomi/ishtarPkg/ishtar.dsc"
+fd = "Build/ishtarPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+submodules = [
+  "Binaries",
+  "Mu_Basecore",
+  "Common/Mu",
+  "Common/Mu_OEM_Sample",
+  "Silicium-ACPI",
+  "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl",
+]
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Xiaomi",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Mu_Basecore",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/Xiaomi",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+]
+
+[firmware.defines]
+ENABLE_SECUREBOOT = "0"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "ishtar"
+
+[payload]
+volume = "ISHTARESP"
+size_mib = 64
+loader = "firmware"
+title = "iOS 18 (ishtar XNU)"
+# Largest contiguous RAM run on ishtar (HyperOS iomem): 0x8c0000000-0xaffffefff, 9 GiB of the 12 GB; DarwinBoot caps the
+# window at 8 GiB (WindowSize.h). XNU needs one contiguous run, so the other ~2.5 GB of fragments stay unused.
+dram_size = "0x200000000"
+# The ADT is the iPhone XR (N841AP, iPhone11,8): the iOS 18 root is that device's (22H352), and as the iPhone X it found no
+# default wallpaper or artwork. XR screen: 414x896 points @2x = 828x1792, stretched to the panel (ishtarfb_scale=2).
+identity = "n841ap"
+display_scale = 2
+points = "414x896"
+panic_screen = false
+timeout = 3
+# All 8 CPUs (cpus=1 to fall back), verbose console on the framebuffer, no UFS (build-payload.py omits the ADT node,
+# so nothing on the phone is written). keys are ported (2010, SPMI v7 reads only); touch/usb default on with SM7150 addresses,
+# so they stay off until ported to SM8550; ishtarlog=0 keeps the persistent log off even if UFS comes up.
+# ishtarearlyfb=1 draws the early console and stage marks on the panel (there is no UART).
+# ishtaralive=5: heartbeat line every 5 s (timer interrupts); ishtarfb_statlog=0: no periodic framebuffer stats.
+kernel_args = [
+  "-v",
+  "debug=0xc",
+  "serial=1",             # output only: this board has no serial keyboard
+  "cpus=8",
+  "keepsyms=1",
+  "-noprogress",
+  "wdt=-1",
+  "ishtarlog=0",
+  "ishtarearlyfb=1",
+  "ishtaralive=5",
+  "ishtarfb_statlog=0",
+  "ishtarfb_hz=60",        # panel copy every vsync (the default 10 was for the CPU renderer; GPU frames arrive at 30-60/s)
+  "ishtarfb_scale=2",      # stretch the iPhone X canvas (2.17) to the 1440x3200 panel (2.22): no black bars, 2.6% taller
+  "ishtartouch=0",
+  # 2011 touch probe (off): "ishtartouchprobe=20", "ishtartouchstage=5" (stage 5 = power, buses, SE8 is GSI-only)
+  "ishtarusb=2",           # 2012: SM8550 USB state + SMMU probe, then USB Ethernet device (ue0 192.168.7.2)
+  "ishtarusbhold=15",      # hold the USB/SMMU lines 15 s on screen
+]
+# build-payload.py --root: the iOS 18 root installed on userdata (upstream full-root cmdline, minus the
+# SM7150 USB/battery/display-hw args; console kept on). Writes userdata.
+root_args = [
+  "rd=ufsroot0",
+  "ufsrw=1",
+  "rootrw=1",
+  "unentitled_ios_sim_launch=1",
+  "ignition_level=1",
+  "wdt_test=no_user_checkin",
+  "launchd_unsecure_cache=1",
+  "ishtararm64e=1",
+  "launchd_disable_all_timeouts=1",
+  "ishtarfb_keepon=1",   # never blank the panel (until keys are verified to wake it)
+]
+
+[payload.adt]
+tool = "tools/base/mkadt.py"   # from scripts/sync-base.py; --board ishtar --mem BASE:SIZE
+unique_chip_id = "required"
+# Must agree with the Kernel RAM window the UEFI memory map gives DarwinBoot.
+owned_memory_size = "0xc0000000"
+
+[bootimg.image]
+# From uefi-ishtar Resources/Configs/ishtar.toml (inherited from nuwa). TODO(ishtar-fdt): check stock boot header.
+header_version = 1
+pagesize = 4096

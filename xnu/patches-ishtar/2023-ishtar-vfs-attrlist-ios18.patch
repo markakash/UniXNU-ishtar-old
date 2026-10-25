@@ -1,0 +1,41 @@
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index 9ab824f..9a7e970 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -2801,6 +2801,16 @@ vfs_attr_pack_internal(mount_t mp, vnode_t vp, uio_t auio, struct attrlist *alp,
+ 		bcopy(&(alp->commonattr), &ab.valid, sizeof(attribute_set_t));
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_ISHTAR)
++	/*
++	 * No content protection here (no Secure Enclave or keystore; the HFS root is mounted without it), so HFS has no class
++	 * for ATTR_CMN_DATA_PROTECT_FLAGS and the call failed (iconservicesagent's icon cache, SpringBoard's icons). Every
++	 * file is in effect class D (no protection), which is what is reported.
++	 */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class) && !VATTR_IS_SUPPORTED(vap, va_dataprotect_class)) {
++		VATTR_RETURN(vap, va_dataprotect_class, 4);
++	}
++#endif
+ 	/* did we ask for something the filesystem doesn't support? */
+ 	if (vap->va_active &&
+ 	    (!VATTR_ALL_SUPPORTED(vap)
+@@ -3188,6 +3198,19 @@ getattrlist_internal(vfs_context_t ctx, vnode_t vp, struct attrlist  *alp,
+ 		error = EINVAL;
+ 		goto out;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_ISHTAR)
++	/*
++	 * The iOS 18.7 userland is newer than this kernel and asks for attributes it does not know (SpringBoard's
++	 * MappedImageCache: volume bit 0x00400000). A caller that asked for ATTR_CMN_RETURNED_ATTRS learns from that mask
++	 * what was returned, so unknown bits are dropped for it instead of failing the whole call.
++	 */
++	if (alp->commonattr & ATTR_CMN_RETURNED_ATTRS) {
++		alp->commonattr &= ATTR_CMN_VALIDMASK;
++		alp->volattr &= ATTR_VOL_VALIDMASK;
++		alp->dirattr &= ATTR_DIR_VALIDMASK;
++		alp->fileattr &= ATTR_FILE_VALIDMASK;
++	}
++#endif
+ 
+ 	VFS_DEBUG(ctx, vp, "%p  ATTRLIST - %s request common %08x vol %08x file %08x dir %08x fork %08x %sfollow on '%s'",
+ 	    vp, vfs_context_proc(ctx)->p_comm, alp->commonattr, alp->volattr, alp->fileattr, alp->dirattr, alp->forkattr,

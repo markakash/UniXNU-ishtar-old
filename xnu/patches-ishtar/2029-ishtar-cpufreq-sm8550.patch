@@ -1,0 +1,218 @@
+diff --git a/bsd/dev/ishtar_cpufreq.c b/bsd/dev/ishtar_cpufreq.c
+index be93fe2..fce7576 100644
+--- a/bsd/dev/ishtar_cpufreq.c
++++ b/bsd/dev/ishtar_cpufreq.c
+@@ -102,6 +102,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t ishtar_processor_idle_time(int cpu);
++extern int ishtar_processor_current(int cpu, uint64_t *tid);      /* osfmk/kern/processor.c */
++extern void ishtar_processor_current_name(int cpu, char *out, size_t size);
+ extern void ishtar_amp_enable(uint64_t big, uint64_t little, int pri);
+ extern kern_return_t thread_terminate(thread_t);
+ extern boolean_t ishtar_cpu_signal_is_enabled(unsigned int cpu);
+@@ -614,6 +616,141 @@ cf_percent_arg(const char *name, int dflt)
+ 	return v;
+ }
+ 
++/*
++ * ishtar (SM8550): the clusters stayed at the firmware's clocks (the governor above is the reference board's OSM block).
++ * Stock DT /soc/qcom,cpufreq-hw "qcom,cpufreq-epss": freq-domain0 0x17d91000 (cpu0-2), 1 0x17d92000 (cpu3-6), 2 0x17d93000
++ * (cpu7). EPSS layout (Linux qcom-cpufreq-hw.c epss_soc_data, register facts only): FREQ_LUT +0x100 + 4 * i (bits 31:30 source,
++ * 0 = 300 MHz alternate; bits 7:0 L-value x 19.2 MHz; the table ends where a row repeats), PERF_STATE +0x320 (LUT index).
++ * Governor (knob cpu.gov=1, default): every 20 ms a cluster's load is its busiest core's busy share (scheduler idle time,
++ * ishtar_processor_idle_time); the state is the lowest whose clock keeps that core at 70 % (90 %+: straight to the cap). Up
++ * at once; down after three low samples, two states at a time. Knobs cpu.perf0/1/2 are the caps (default the top state);
++ * cpu.gov=0 runs every cluster at its cap. Boot-arg ishtarcpuperf=0: the firmware's states, untouched.
++ * ponytail: no touch boost yet (the input hook is the reference board's); add it if the ramp-up from idle shows.
++ */
++extern void ishtar_knob_register(const char *name, volatile uint32_t *value);  /* bsd/dev/ishtar_push.c */
++static volatile uint32_t cf8_want[3], cf8_gov = 1;
++static uint32_t cf8_set[3], cf8_rows[3], cf8_low[3], cf8_load_seen[3];
++static uint64_t cf8_idle[8];
++static const uint8_t cf8_first[3] = {0, 3, 7}, cf8_ncpu[3] = {3, 4, 1};
++static vm_offset_t cf8_base[3];
++
++static uint32_t
++cf8_khz(unsigned d, uint32_t i)
++{
++	const uint32_t row = *(volatile uint32_t *)(cf8_base[d] + 0x100 + 4 * i);
++	return (row >> 30) == 0 ? 300000 : (row & 0xff) * 19200;
++}
++
++/* Busiest core of domain d, % busy over wall (mach time) since the last call. */
++static uint32_t
++cf8_load(unsigned d, uint64_t wall)
++{
++	uint32_t worst = 0;
++	for (unsigned k = cf8_first[d]; k < cf8_first[d] + cf8_ncpu[d]; k++) {
++		const uint64_t idle = ishtar_processor_idle_time((int)k);
++		if (idle == ~0ULL) {
++			continue;
++		}
++		const uint64_t di = idle - cf8_idle[k];
++		cf8_idle[k] = idle;
++		if (wall != 0 && di < wall) {
++			worst = MAX(worst, (uint32_t)((wall - di) * 100 / wall));
++		}
++	}
++	return worst;
++}
++
++static void
++cf8_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t last = mach_absolute_time();
++	uint32_t ticks = 0;
++	for (;;) {
++		delay(20 * 1000);
++		const uint64_t now = mach_absolute_time(), wall = now - last;
++		last = now;
++		ticks++;
++		for (unsigned d = 0; d < 3; d++) {
++			const uint32_t cap = MIN(cf8_want[d], cf8_rows[d] - 1), load = cf8_load(d, wall);
++			cf8_load_seen[d] = load;
++			uint32_t w = cap;
++			if (cf8_gov && load < 90) {
++				const uint64_t need = (uint64_t)cf8_khz(d, MIN(cf8_set[d], cf8_rows[d] - 1)) * load / 70;
++				for (w = 0; w < cap && cf8_khz(d, w) < need; w++) {
++				}
++				if (w < cf8_set[d]) {          /* down: after three low samples, two states at a time */
++					w = ++cf8_low[d] < 3 ? cf8_set[d] : MAX(w, cf8_set[d] >= 2 ? cf8_set[d] - 2 : 0);
++				}
++			}
++			if (w >= cf8_set[d]) {
++				cf8_low[d] = 0;
++			}
++			if (w != cf8_set[d]) {
++				*(volatile uint32_t *)(cf8_base[d] + 0x320) = w;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				cf8_set[d] = w;
++				if (w <= cf8_set[d]) {
++					cf8_low[d] = 0;
++				}
++			}
++		}
++		if (ticks % 250 == 0) {        /* every 5 s */
++			uint64_t idle0 = ishtar_processor_idle_time(0), idle7 = ishtar_processor_idle_time(7);
++			char who[512];
++			size_t wn = 0;
++			for (int c = 0; c < 8 && wn < sizeof(who) - 24; c++) {
++				uint64_t tid;
++				const int pid = ishtar_processor_current(c, &tid);
++				char nm[64];
++				ishtar_processor_current_name(c, nm, sizeof(nm));
++				wn += (size_t)snprintf(who + wn, sizeof(who) - wn, pid == -1 ? " %d:idle" : " %d:%d/%llu/%s", c, pid, tid, nm);
++			}
++			printf("ISHTAR CPUFREQ: running%s\n", who);
++			printf("ISHTAR CPUFREQ: gov %u: %u/%u/%u MHz (caps %u/%u/%u) load %u/%u/%u%% idle cpu0 %llu cpu7 %llu\n", cf8_gov,
++			    cf8_khz(0, cf8_set[0]) / 1000, cf8_khz(1, cf8_set[1]) / 1000, cf8_khz(2, cf8_set[2]) / 1000, cf8_want[0], cf8_want[1],
++			    cf8_want[2], cf8_load_seen[0], cf8_load_seen[1], cf8_load_seen[2], idle0, idle7);
++		}
++	}
++}
++
++static void
++cf8_start(void)
++{
++	static const uint32_t pa[3] = {0x17d91000u, 0x17d92000u, 0x17d93000u};
++	uint32_t on = 1;
++	thread_t thread;
++	(void)PE_parse_boot_argn("ishtarcpuperf", &on, sizeof(on));
++	for (unsigned d = 0; d < 3; d++) {
++		cf8_base[d] = ml_io_map(pa[d], 0x1000);
++		if (!cf8_base[d]) {
++			printf("ISHTAR CPUFREQ: sm8550 domain %u not mapped\n", d);
++			return;
++		}
++		uint32_t n = 0, prev = 0;
++		for (; n < 40; n++) {
++			const uint32_t khz = cf8_khz(d, n);
++			if (n && khz == prev) {
++				break;
++			}
++			prev = khz;
++		}
++		cf8_rows[d] = n ? n : 1;
++		cf8_set[d] = *(volatile uint32_t *)(cf8_base[d] + 0x320);
++		cf8_want[d] = on ? cf8_rows[d] - 1 : cf8_set[d];
++		printf("ISHTAR CPUFREQ: sm8550 domain %u: %u states %u..%u kHz, firmware left state %u (%u kHz)%s\n", d, cf8_rows[d],
++		    cf8_khz(d, 0), cf8_khz(d, cf8_rows[d] - 1), cf8_set[d], cf8_khz(d, MIN(cf8_set[d], cf8_rows[d] - 1)),
++		    on ? ", going to the top state" : " (ishtarcpuperf=0)");
++	}
++	cf8_gov = on ? 1 : 0;      /* ishtarcpuperf=0: the firmware's states stay */
++	ishtar_knob_register("cpu.perf0", &cf8_want[0]);
++	ishtar_knob_register("cpu.perf1", &cf8_want[1]);
++	ishtar_knob_register("cpu.perf2", &cf8_want[2]);
++	ishtar_knob_register("cpu.gov", &cf8_gov);
++	if (kernel_thread_start(cf8_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Name kept from the first version (patch 0093), called from ishtar_ufs_init(). */
+ void
+ ishtar_cpufreq_max(void)
+@@ -621,7 +758,14 @@ ishtar_cpufreq_max(void)
+ 	char arg[16] = "gov";
+ 	thread_t thread;
+ 
+-	if (!ishtar_board_ref() || cf_started) {
++	if (!ishtar_board_ref()) {
++		if (!cf_started) {
++			cf_started = true;
++			cf8_start();
++		}
++		return;
++	}
++	if (cf_started) {
+ 		return;
+ 	}
+ 	cf_started = true;
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index 97582e6..c9535d7 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -751,6 +751,42 @@ processor_cpu_load_info(processor_t processor,
+  * CPU in mach absolute time units, from the scheduler's idle accounting
+  * (processor_idle(), the WFI path). ~0 if the processor is not registered.
+  */
++/* What runs on cpu now: its task's pid (0 = kernel), -1 idle, -2 no such cpu; *tid the thread id (governor diagnostics). */
++int ishtar_processor_current(int cpu, uint64_t *tid);
++int
++ishtar_processor_current(int cpu, uint64_t *tid)
++{
++	processor_t processor = (cpu >= 0 && cpu < MAX_SCHED_CPUS) ? processor_array[cpu] : PROCESSOR_NULL;
++	*tid = 0;
++	if (processor == PROCESSOR_NULL) {
++		return -2;
++	}
++	thread_t thread = processor->active_thread;
++	if (thread == THREAD_NULL || thread == processor->idle_thread) {
++		return -1;
++	}
++	*tid = thread->thread_id;
++	return task_pid(get_threadtask(thread));
++}
++
++/* The thread's name (kernel threads: what the driver called it, or its continuation's address), for the same log. */
++void ishtar_processor_current_name(int cpu, char *out, size_t size);
++void
++ishtar_processor_current_name(int cpu, char *out, size_t size)
++{
++	processor_t processor = (cpu >= 0 && cpu < MAX_SCHED_CPUS) ? processor_array[cpu] : PROCESSOR_NULL;
++	out[0] = 0;
++	if (processor == PROCESSOR_NULL || processor->active_thread == THREAD_NULL ||
++	    processor->active_thread == processor->idle_thread) {
++		return;
++	}
++	thread_t thread = processor->active_thread;
++	thread_get_thread_name(thread, out);
++	if (!out[0]) {
++		snprintf(out, size, "c%llx", (unsigned long long)VM_KERNEL_UNSLIDE((uintptr_t)thread->continuation));
++	}
++}
++
+ uint64_t ishtar_processor_idle_time(int cpu);
+ uint64_t
+ ishtar_processor_idle_time(int cpu)

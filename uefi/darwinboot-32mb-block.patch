@@ -1,0 +1,13 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index e2c5d91..2e9f12a 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -18,7 +18,7 @@
+ #include "WindowSize.h"
+ 
+ #define WINDOW_SIZE  SIZE_256MB
+-#define BLOCK_SIZE   SIZE_2MB
++#define BLOCK_SIZE   SIZE_32MB  // 16 KiB-page kernels map with 32 MiB L2 blocks: VA and PA must agree mod 32 MiB
+ #define MAX_SEGMENTS 64
+ 
+ typedef struct {

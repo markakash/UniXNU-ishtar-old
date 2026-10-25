@@ -1,0 +1,65 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 8654c78..289c945 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1875,7 +1875,7 @@ ishtar_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0xb8000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/ishtar_early.c b/osfmk/arm64/ishtar_early.c
+index 0140d95..5fe68a1 100644
+--- a/osfmk/arm64/ishtar_early.c
++++ b/osfmk/arm64/ishtar_early.c
+@@ -17,10 +17,10 @@
+  * splash framebuffer of both boards (ishtar 0x9c000000 1080x2400, Ishtar
+  * 0x9d400000 1080x2246); ishtar_early_set_video picks it from boot_args.
+  */
+-#define EARLY_BLOCK_PA 0x9c000000ull
++#define EARLY_BLOCK_PA 0xb8000000ull	/* SM8550 splash_region; the old 0x9c000000 is a protected carve-out here */
+ #define EARLY_BLOCK_SIZE 0x2000000ull
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+-static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
++static unsigned int early_width = 1440u, early_height = 3200u, early_stride = 5760u / 4;
+ static uint64_t early_off;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 1b5832a..ec4481f 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -523,13 +523,16 @@ LEXT(start_first_cpu)
+ 	mov		x21, #0
+ 
+ #if defined(ISHTAR)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	/*
++	 * Stage 0: full-width white band across the middle (rows 1568-1631), no stack or page tables needed.
++	 * SM8550 splash 0xb8000000, 1440x3200, 5760 B/row; the panel's rounded corners hide the edges.
++	 */
++	MOV64	x0, (0xb8000000 + 1568 * 5760)
+ 	mov		w1, #-1
+-	mov		x2, #32
+-	mov		x4, #4320
++	mov		x2, #64
++	mov		x4, #5760
+ Lishtar_mark_row:
+-	mov		x3, #64
++	mov		x3, #1440
+ 	mov		x5, x0
+ Lishtar_mark_pixel:
+ 	str		w1, [x5], #4
+@@ -695,7 +698,7 @@ Lkernelcache_base_found:
+ 	 * ISHTAR uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0xb8000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)

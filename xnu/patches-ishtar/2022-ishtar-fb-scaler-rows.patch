@@ -1,0 +1,325 @@
+diff --git a/bsd/kern/ishtar_amfi.c b/bsd/kern/ishtar_amfi.c
+index f3d4d89..50c9cc7 100644
+--- a/bsd/kern/ishtar_amfi.c
++++ b/bsd/kern/ishtar_amfi.c
+@@ -826,7 +826,7 @@ ishtar_syserr_trace(struct proc *p, unsigned short code, int error, const uint64
+ 		return;
+ 	}
+ 
+-	char detail[112];
++	char detail[200];
+ 	detail[0] = '\0';
+ 	int pi = ishtar_syserr_path_arg(code);
+ 	uint64_t key = ishtar_syserr_hash(0xcbf29ce484222325ULL, name);
+@@ -911,6 +911,15 @@ ishtar_syserr_trace(struct proc *p, unsigned short code, int error, const uint64
+ 		key = (key ^ (uint32_t)arg[0]) * 0x100000001b3ULL;
+ 		key = (key ^ (uint32_t)arg[2]) * 0x100000001b3ULL;
+ 	}
++	if (code == 220 && error == EINVAL && arg[1] != 0) {
++		/* getattrlist(path, attrlist, buf, size, options): which attribute groups HFS refused (iOS expects APFS) */
++		struct { uint16_t count, reserved; uint32_t common, vol, dir, file, fork; } al;
++		size_t at = strlen(detail);
++		if (copyin((user_addr_t)arg[1], &al, sizeof(al)) == 0 && at < sizeof(detail)) {
++			snprintf(detail + at, sizeof(detail) - at, " a=%x/%x/%x/%x/%x o=%llx", al.common, al.vol, al.dir, al.file,
++			    al.fork, arg[4]);
++		}
++	}
+ 
+ 	int seen = os_atomic_load(&ishtar_syserr_count, relaxed);
+ 	if (seen > ISHTAR_SYSERR_MAX) {
+diff --git a/iokit/Kernel/arm/IshtarFramebuffer.cpp b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+index 2f79215..1a25e6c 100644
+--- a/iokit/Kernel/arm/IshtarFramebuffer.cpp
++++ b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+@@ -130,6 +130,7 @@ static uint64_t ishtar_abs_us(uint64_t abs);
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ #include <sys/errno.h>
+ 
+@@ -223,6 +224,8 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+  * service; until the GPU probe has published its context the call answers kIOReturnNotReady and the plugin declines.
+  */
+ extern "C" IOReturn native_adreno_new_user_client(IOService *, task_t, void *, UInt32, OSDictionary *, IOUserClient **, unsigned);
++extern "C" int native_adreno_wait_idle(uint32_t timeout_us);
++static void ishtar_dpu_probe_thread(void *arg, wait_result_t wr);   /* ishtarfb_dpuprobe=1, below */   /* a740/NativeAdrenoPublish.cpp: -1 no GPU, 0 idle, 1 timeout */
+ 
+ IOReturn
+ IOAcceleratorES::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
+@@ -273,12 +276,13 @@ public:
+ 	/*
+ 	 * ishtarfb_scale: 0 = show the centred panel-sized part (crop),
+ 	 * 1 = scale to fit keeping the aspect (bars), 2 = stretch to fill.
+-	 * panel = pad + logical * num / den, per axis; fXMap: per-column source.
++	 * panel = pad + logical * num / den, per axis; fXMap: per-column source (within the drawn rectangle).
+ 	 */
+ 	uint32_t      fScale;
+ 	uint32_t      fScaleXNum, fScaleXDen, fScaleYNum, fScaleYDen;
+ 	int32_t       fPadX, fPadY;
+ 	uint32_t     *fXMap;
++	uint32_t     *fRowIn, *fRowOut;    /* cached rows of the CPU scaler: one source row, one panel row */
+ 	bool          fBarsCleared;
+ 	/*
+ 	 * Ishtar MDP (SDM845 DPU) page flipping, after ios-ishtar 0092/0100/0102:
+@@ -407,6 +411,7 @@ public:
+ 		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past 50 ms */
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
++		uint64_t gpuWaitTimeouts;                               /* 2022: swaps copied although the GPU had not finished in 30 ms */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+ 		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
+ 		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
+@@ -650,7 +655,9 @@ AppleCLCD::start(IOService *provider)
+ 		fPadX = (int32_t)(fWidth - (uint64_t)fLogicalW * fScaleXNum / fScaleXDen) / 2;
+ 		fPadY = (int32_t)(fHeight - (uint64_t)fLogicalH * fScaleYNum / fScaleYDen) / 2;
+ 		fXMap = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
+-		if (fXMap == NULL) {
++		fRowIn = (uint32_t *)IOMallocData(fLogicalW * sizeof(uint32_t));
++		fRowOut = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++		if (fXMap == NULL || fRowIn == NULL || fRowOut == NULL) {
+ 			fScale = 0;
+ 		}
+ 	}
+@@ -682,6 +689,14 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("ISHTAR FB: ishtarfb_hud=%d: performance HUD %s (sysctl kern.ishtar_fb_hud)\n", hud, hud ? "on" : "off");
+ 		}
+ 	}
++	{
++		int dpu = 0;
++		thread_t t;
++		if (PE_parse_boot_argn("ishtarfb_dpuprobe", &dpu, sizeof(dpu)) && dpu &&
++		    kernel_thread_start(ishtar_dpu_probe_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
+ 	if (ishtar_board_ref()) {
+ 		mdpProbe();
+ 		int flip = 0;
+@@ -1446,6 +1461,66 @@ mdp_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * SM8550 display path dump (boot-arg ishtarfb_dpuprobe=1, read-only): every DPU block of the mainline catalog
++ * (dpu_9_0_sm8550.h, offsets from the DPU top at 0xae01000) and the DSI0 controller, as the bootloader left them, two
++ * minutes after start (a read at 40 s, before the root and the USB log, stalled the boot with nothing logged). The ground truth for the SM8550 display driver (page flip, scaler, 120 Hz).
++ */
++static void __attribute__((unused))   /* the block dump, back once single reads answer */
++ishtar_dpu_dump_range(vm_offset_t base, const char *name, uint32_t from, uint32_t to)
++{
++	/* name first and a pause: a read that stalls the bus (a block without clock or power) leaves its name as the last line */
++	IOLog("ISHTAR DPU: reading %s +%03x..%03x\n", name, from, to);
++	IOSleep(100);
++	for (uint32_t off = from; off < to; off += 32) {
++		uint32_t v[8];
++		bool any = false;
++		for (int i = 0; i < 8; i++) {
++			v[i] = mdp_rd(base, off + 4 * i);
++			any |= v[i] != 0;
++		}
++		if (any) {
++			IOLog("ISHTAR DPU: %s +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", name, off,
++			    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++		}
++	}
++}
++
++static void
++ishtar_dpu_probe_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	/* ishtarfb_dpuprobe=N: start N s after boot (default 120); the root and the USB log come up at 45-75 s */
++	uint32_t secs = 120;
++	PE_parse_boot_argn("ishtarfb_dpuprobe", &secs, sizeof(secs));
++	IOSleep((secs < 2 ? 120 : secs) * 1000);
++	vm_offset_t mdp = ml_io_map(0x0ae00000u, 0x84000u), dsi = ml_io_map(0x0ae94000u, 0x1000u);
++	if (mdp == 0 || dsi == 0) {
++		IOLog("ISHTAR DPU: no mapping\n");
++		return;
++	}
++	/*
++	 * One register at a time, each named before it is read (dpu-2: the first 32-byte group of the DPU top stalled the
++	 * bus): the hardware versions, the active CTL, VIG0/DMA0 sources and INTF_1 (DSI0). Widened once these answer.
++	 */
++	static const struct { const char *name; uint32_t off; bool dsi; } regs[] = {
++		{"mdss hw_version", 0x00000}, {"mdss hw_intr_status", 0x00010},
++		{"top +000", 0x01000}, {"top +004", 0x01004}, {"top +3fc hw_rev?", 0x013fc},
++		{"ctl0 top", 0x16014}, {"ctl0 flush", 0x16018}, {"ctl0 intf_active", 0x160f4}, {"ctl0 dsc_active", 0x160e8},
++		{"ctl0 pipe_active", 0x1612c}, {"ctl0 layer0", 0x16000},
++		{"vig0 src_size", 0x05000}, {"vig0 src0_addr", 0x05014}, {"vig0 ystride0", 0x05024}, {"vig0 format", 0x05030},
++		{"dma0 src_size", 0x25000}, {"dma0 src0_addr", 0x25014}, {"dma0 ystride0", 0x25024}, {"dma0 format", 0x25030},
++		{"intf1 timing_en", 0x36000}, {"intf1 config", 0x36004}, {"intf1 status", 0x3626c},
++		{"intf1 tear_check_en", 0x36284}, {"intf1 autorefresh", 0x362b4},
++		{"dsi0 hw_version", 0x000, true}, {"dsi0 ctrl", 0x004, true}, {"dsi0 status", 0x008, true},
++	};
++	for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		IOLog("ISHTAR DPU: read %s\n", regs[i].name);
++		IOSleep(100);
++		IOLog("ISHTAR DPU: %s = %08x\n", regs[i].name, mdp_rd(regs[i].dsi ? dsi : mdp, regs[i].off));
++	}
++	IOLog("ISHTAR DPU: dump done\n");
++}
++
+ /* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
+ void
+ AppleCLCD::mdpProbe(void)
+@@ -3178,6 +3253,114 @@ AppleCLCD::presentCanvas(IshtarSurface *s, uintptr_t src, int32_t sx, int32_t sy
+ 	}
+ }
+ 
++/*
++ * CPU scaler bands (patch 2022): the panel rows of one layer are cut into contiguous bands, one per thread; the caller
++ * scales the first band and ishtarfb_threads (default 4, 0 = caller only) worker threads the others, each with its own
++ * cached rows. ponytail: one job at a time (present() runs on the work loop), no affinity; pin to big cores if it matters.
++ */
++struct IshtarScaleJob {
++	const uint8_t *base;
++	uint64_t bpr, rowBytes;
++	uintptr_t draw;
++	const uint32_t *xmap;
++	int32_t sx, sy, w, h, dy, px0, n, py0, py1, padY;
++	uint32_t yNum, yDen;
++};
++#define ISHTAR_SCALE_MAX_THREADS 7
++static IshtarScaleJob gScaleJob;
++static IOLock *gScaleLock;
++static uint32_t gScaleGen, gScaleDone, gScaleThreads;
++
++static void
++ishtar_scale_band(const IshtarScaleJob &j, uint32_t band, uint32_t bands, uint32_t *rowIn, uint32_t *rowOut)
++{
++	int32_t rows = j.py1 - j.py0, a = j.py0 + (int32_t)((int64_t)rows * band / bands), b = j.py0 + (int32_t)((int64_t)rows * (band + 1) / bands);
++	int32_t built = -1;
++	for (int32_t py = a; py < b; py++) {
++		int32_t ly = (int32_t)((uint64_t)(py - j.padY) * j.yDen / j.yNum) - j.dy;
++		ly = ly < 0 ? 0 : (ly >= j.h ? j.h - 1 : ly);
++		if (ly != built) {
++			/*
++			 * The GPU writes the surface straight to DRAM; a cacheable kernel view may still hold lines of an earlier
++			 * frame (flip-1: 16-pixel streaks, one 64-byte line each, where content changed). Drop the row's lines first.
++			 */
++			const uint8_t *row = j.base + (uint64_t)(j.sy + ly) * j.bpr + (uint64_t)j.sx * 4;
++			for (uintptr_t a = (uintptr_t)row & ~(uintptr_t)63; a < (uintptr_t)row + (size_t)j.w * 4; a += 64) {
++				__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			memcpy(rowIn, row, (size_t)j.w * 4);
++			for (int32_t i = 0; i < j.n; i++) {
++				rowOut[i] = rowIn[j.xmap[i]];
++			}
++			built = ly;
++		}
++		memcpy((void *)((uint32_t *)(j.draw + (uint64_t)py * j.rowBytes) + j.px0), rowOut, (size_t)j.n * 4);
++	}
++}
++
++static void
++ishtar_scale_worker(void *arg, wait_result_t wr __unused)
++{
++	uint32_t band = (uint32_t)(uintptr_t)arg, seen = 0;
++	uint32_t *rowIn = (uint32_t *)IOMallocData(4096 * sizeof(uint32_t)), *rowOut = (uint32_t *)IOMallocData(4096 * sizeof(uint32_t));
++	for (;;) {
++		IOLockLock(gScaleLock);
++		while (gScaleGen == seen) {
++			IOLockSleep(gScaleLock, &gScaleGen, THREAD_UNINT);
++		}
++		seen = gScaleGen;
++		IshtarScaleJob job = gScaleJob;
++		IOLockUnlock(gScaleLock);
++		if (rowIn && rowOut && job.w <= 4096 && job.n <= 4096) {
++			ishtar_scale_band(job, band, gScaleThreads + 1, rowIn, rowOut);
++		}
++		IOLockLock(gScaleLock);
++		gScaleDone++;
++		IOLockWakeup(gScaleLock, &gScaleDone, false);
++		IOLockUnlock(gScaleLock);
++	}
++}
++
++/* Scales job's rows on the caller and the worker pool (started on first use); returns when every band is written. */
++static void
++ishtar_scale_rows(const IshtarScaleJob &job, uint32_t *rowIn, uint32_t *rowOut)
++{
++	static bool started;
++	if (!started) {
++		started = true;
++		uint32_t threads = 4;
++		PE_parse_boot_argn("ishtarfb_threads", &threads, sizeof(threads));
++		threads = threads > ISHTAR_SCALE_MAX_THREADS ? ISHTAR_SCALE_MAX_THREADS : threads;
++		gScaleLock = threads ? IOLockAlloc() : NULL;
++		for (uint32_t i = 0; gScaleLock && i < threads; i++) {
++			thread_t t;
++			if (kernel_thread_start(ishtar_scale_worker, (void *)(uintptr_t)(i + 1), &t) != KERN_SUCCESS) {
++				break;
++			}
++			thread_deallocate(t);
++			gScaleThreads++;
++		}
++		IOLog("ISHTAR FB: CPU scaler on %u threads\n", gScaleThreads + 1);
++	}
++	if (!gScaleThreads) {
++		ishtar_scale_band(job, 0, 1, rowIn, rowOut);
++		return;
++	}
++	IOLockLock(gScaleLock);
++	gScaleJob = job;
++	gScaleDone = 0;
++	gScaleGen++;
++	IOLockWakeup(gScaleLock, &gScaleGen, false);
++	IOLockUnlock(gScaleLock);
++	ishtar_scale_band(job, 0, gScaleThreads + 1, rowIn, rowOut);
++	IOLockLock(gScaleLock);
++	while (gScaleDone < gScaleThreads) {
++		IOLockSleep(gScaleLock, &gScaleDone, THREAD_UNINT);
++	}
++	IOLockUnlock(gScaleLock);
++}
++
+ /*
+  * One layer, logical rect (dx,dy,w,h) from surface origin (sx,sy), scaled
+  * into the panel with nearest-neighbour sampling: every panel pixel picks
+@@ -3233,19 +3416,17 @@ AppleCLCD::presentScaled(IshtarSurface *s, uintptr_t src, int32_t sx, int32_t sy
+ 	for (int32_t px = px0; px < px1; px++) {
+ 		int32_t lx = (int32_t)((uint64_t)(px - fPadX) * fScaleXDen / fScaleXNum) - dx;
+ 		lx = lx < 0 ? 0 : (lx >= w ? w - 1 : lx);
+-		fXMap[px - px0] = (uint32_t)(sx + lx);
+-	}
+-	const uint8_t *base = (const uint8_t *)(src + s->offset);
+-	for (int32_t py = py0; py < py1; py++) {
+-		int32_t ly = (int32_t)((uint64_t)(py - fPadY) * fScaleYDen / fScaleYNum) - dy;
+-		ly = ly < 0 ? 0 : (ly >= h ? h - 1 : ly);
+-		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly) * s->bytesPerRow);
+-		volatile uint32_t *drow = (volatile uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
+-		int32_t n = px1 - px0;
+-		for (int32_t i = 0; i < n; i++) {
+-			drow[i] = srow[fXMap[i]];
+-		}
++		fXMap[px - px0] = (uint32_t)lx;     /* column in the cached source row */
+ 	}
++	/*
++	 * The surface is mapped uncached (the GPU writes it), so single-pixel loads from it were the scaler's cost (int g2-e:
++	 * about 9 of 30-45 swaps a second reached the panel). Each source row is read once with memcpy's wide loads into a
++	 * cached row, scaled there, and the panel row goes out in one memcpy; a panel row that repeats the previous source row
++	 * (2436 -> 3200 repeats about one in four) is written again from the cached row. Bands run on several threads.
++	 */
++	IshtarScaleJob job = {(const uint8_t *)(src + s->offset), s->bytesPerRow, fRowBytes, fDraw, fXMap,
++		                  sx, sy, w, h, dy, px0, px1 - px0, py0, py1, fPadY, fScaleYNum, fScaleYDen};
++	ishtar_scale_rows(job, fRowIn, fRowOut);
+ }
+ 
+ void
+@@ -3270,6 +3451,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ 	fCurSwapID = get32(rec, 0x50);
+ 	quietConsole();
++	/*
++	 * GPU-composited frames (ishtarmetal=1): backboardd swaps right after submitting its Metal work, so the surface may
++	 * still be drawn; copying it then showed half-drawn (ghosted) and empty frames. Wait for the GPU first (30 ms cap).
++	 */
++	if (native_adreno_wait_idle(30000) > 0) {
++		fSt.gpuWaitTimeouts++;
++	}
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		fEmptyBlackArmed = false;

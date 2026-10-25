@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/ishtar_keys.c b/bsd/dev/ishtar_keys.c
+index fbdcfb8..0d79033 100644
+--- a/bsd/dev/ishtar_keys.c
++++ b/bsd/dev/ishtar_keys.c
+@@ -1,8 +1,8 @@
+ /*
+  * Minimal polled ISHTAR keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * Ishtar (ishtar): power/RESIN on PM8998 PON (SID 0, same block),
+- * volume-up on PM8998 GPIO6 (SID 0, 0xc500; mainline gpio-keys).
++ * ishtar (SM8550, SPMI arbiter v7, EE 0, stock DT): power = PMK8550 (SID 0) PON 0x1300 RT_STS bit 7,
++ * volume down = RESIN bit 6 (linux,code 0x72), volume up = PM8550 (SID 1) GPIO6 0x8d00, active low.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -20,18 +20,17 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ishtar_hid_key(int key, int down);
+ void ishtar_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
+-#define KEYS_PON_RT      0x0810u
++#define KEYS_CORE_PA     0x0c400000u     /* arbiter v7 core, APID map at +0x2000 */
++#define KEYS_OBS_PA      0x0c440000u     /* observer channels, EE 0, 0x20 per APID */
++#define KEYS_PON_RT      0x1310u
+ /* volume-up GPIO peripheral: ishtar PM6150L GPIO2 (SID 4), ishtar PM8998 GPIO6 (SID 0) */
+ #define KEYS_GPIO_BASE   (keys_gpio_base)
+ #define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
++static vm_offset_t keys_core, keys_obs;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+-static uint16_t keys_gpio_base = 0xc100u, keys_gpio_ppid = 0x4c1u;
++static uint16_t keys_gpio_base = 0x8d00u, keys_gpio_ppid = 0x18du;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -44,22 +43,16 @@ keys_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
+ static uint16_t
+ keys_find_apid(uint16_t ppid, uint32_t count)
+ {
+-	uint16_t found = KEYS_NO_APID;
+ 	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
+-		if (found == KEYS_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
++		uint32_t map = keys_rd(keys_core, 0x2000u + 4u * i);
++		if (map != 0 && ((map >> 8) & 0xfffu) == ppid) {
++			return (uint16_t)i;
+ 		}
+ 	}
+-	return found;
++	return KEYS_NO_APID;
+ }
+ 
+ static bool
+@@ -68,7 +61,7 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
++	uint32_t off = 0x20u * apid; /* obs + EE(0)*0x8000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+@@ -107,7 +100,7 @@ keys_thread(void *arg, wait_result_t result)
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
++		int now[3] = {!!(pon & 0x80u), !(gpio & 1u), !!(pon & 0x40u)};   /* power, volume up, volume down */
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("ISHTAR KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+@@ -146,22 +139,21 @@ ishtar_keys_init(void)
+ 		keys_gpio_base = 0xc500u;
+ 		keys_gpio_ppid = 0x0c5u;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_core = ml_io_map(KEYS_CORE_PA, 0x3000);
++	keys_obs = ml_io_map(KEYS_OBS_PA, 0x8000);
++	if (!keys_core || !keys_obs) {
+ 		printf("ISHTAR KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+ 	keys_version = keys_rd(keys_core, 0);
+ 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
++	if (keys_version < 0x70000000u || keys_version >= 0x80000000u ||
++	    count == 0 || count > 1024) {
+ 		printf("ISHTAR KEYS: unsupported arbiter version=%#x apids=%u\n",
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
++	keys_pon_apid = keys_find_apid(0x013, count);
+ 	keys_gpio_apid = keys_find_apid(keys_gpio_ppid, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);

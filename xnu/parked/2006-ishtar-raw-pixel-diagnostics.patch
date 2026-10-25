@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/IshtarPlatformExpert.cpp b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+index 01686b7..950b2a7 100644
+--- a/iokit/Kernel/arm/IshtarPlatformExpert.cpp
++++ b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+@@ -33,6 +33,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IshtarPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" void ishtar_diag_block(unsigned int row, unsigned int slot, uint32_t color);
++
+ /*
+  * Bring-up heartbeat (boot-arg ishtaralive=N seconds, 0 = off): one line every N s for a minute.
+  * It sleeps on the timer, so lines appearing means timer interrupts and the scheduler work.
+@@ -41,6 +43,18 @@ static void
+ ishtar_alive_thread(void *arg, wait_result_t wr __unused)
+ {
+ 	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	ishtar_diag_block(0, 1, 0x0000ffffu);          /* row 0 slot 1 cyan: this thread was scheduled */
++	/* Row 3: a yellow block moving every second by polling the counter, no timer interrupt needed. */
++	uint64_t step, next = mach_absolute_time();
++	nanoseconds_to_absolutetime(1000000000ull, &step);
++	for (unsigned int n = 0; n < 10; n++) {
++		next += step;
++		while (mach_absolute_time() < next) {
++			;
++		}
++		ishtar_diag_block(3, (n + 23) % 24, 0x00202020u);
++		ishtar_diag_block(3, n % 24, 0x00ffff00u);
++	}
+ 	for (uint32_t n = 1; n * secs <= 60; n++) {
+ 		IOSleep(secs * 1000);
+ 		uint64_t ns;
+@@ -59,6 +73,7 @@ IshtarPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("ISHTAR: platform expert registered\n");
++	ishtar_diag_block(0, 0, 0x00ffffffu);          /* row 0 slot 0 white: platform expert start() reached its end */
+ 	uint32_t alive = 0;
+ 	thread_t thread;
+ 	if (PE_parse_boot_argn("ishtaralive", &alive, sizeof(alive)) && alive > 0 &&
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a6674cb..29023c2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2396,6 +2396,10 @@ handle_simd_trap(arm_saved_state_t *state, uint64_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(ISHTAR)
++extern void ishtar_diag_block(unsigned int row, unsigned int slot, uint32_t color);
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -2413,6 +2417,21 @@ sleh_irq(arm_saved_state_t *state)
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
++	{
++		/* Bring-up: row 1 cursor per interrupt (green timer, blue IPI, red device, gray spurious); row 2 last device ID. */
++		static uint32_t ishtar_irq_seen;
++		uint32_t n = ishtar_irq_seen++;
++		uint32_t color = intid == ishtar_vtimer_intid ? 0x0000ff00u : intid < 16 ? 0x000080ffu :
++		    intid >= 1020 ? 0x00808080u : 0x00ff0000u;
++		ishtar_diag_block(1, (n + 23) % 24, 0x00202020u);
++		ishtar_diag_block(1, n % 24, color);
++		if (intid >= 16 && intid < 1020 && intid != ishtar_vtimer_intid) {
++			for (unsigned int b = 0; b < 10; b++) {
++				ishtar_diag_block(2, 23 - b, ((intid >> b) & 1) ? 0x00ffffffu : 0x00303030u);
++			}
++		}
++	}
++
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 7bc2511..023475d 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3712,3 +3712,30 @@ vc_set_progressmeter(int new_value)
+ }
+ 
+ #endif /* defined(XNU_TARGET_OS_OSX) */
++
++#if defined(ISHTAR)
++/*
++ * Bring-up diagnostics that bypass the console (no locks, no timers): a 40x40 block in one of four rows
++ * near the bottom of the panel. Usable from interrupt context once the video console has mapped the panel.
++ */
++void ishtar_diag_block(unsigned int row, unsigned int slot, uint32_t color);
++void
++ishtar_diag_block(unsigned int row, unsigned int slot, uint32_t color)
++{
++	unsigned long base = vinfo.v_baseaddr;
++	if (base == 0 || vinfo.v_depth != 32 || row > 3 || vinfo.v_height < 300) {
++		return;
++	}
++	unsigned int x0 = 40 + slot * 44, y0 = vinfo.v_height - 260 + row * 60;
++	if (x0 + 40 > vinfo.v_width) {
++		return;
++	}
++	for (unsigned int y = 0; y < 40; y++) {
++		volatile uint32_t *line = (volatile uint32_t *)(base + (unsigned long)(y0 + y) * vinfo.v_rowbytes);
++		for (unsigned int x = 0; x < 40; x++) {
++			line[x0 + x] = color;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif /* ISHTAR */

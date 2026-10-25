@@ -1,0 +1,368 @@
+diff --git a/bsd/dev/ishtar_a630.c b/bsd/dev/ishtar_a630.c
+index 7a16074..99bae6c 100644
+--- a/bsd/dev/ishtar_a630.c
++++ b/bsd/dev/ishtar_a630.c
+@@ -47,6 +47,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/errno.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+@@ -3740,6 +3741,7 @@ ishtar_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *go
+ static void
+ a630_pm_thread(void *arg, wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-a630-pm");
+ 	uint64_t last = mach_absolute_time(), summary = last, hb = last;
+ 
+ 	(void)arg;
+@@ -3919,6 +3921,7 @@ a630_run(int mode)
+ static void
+ a630_thread(void *arg, wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-a630");
+ 	(void)arg;
+ 	(void)wr;
+ 	int wait = 600;
+diff --git a/bsd/dev/ishtar_charger.c b/bsd/dev/ishtar_charger.c
+index 2868f60..0a5c18c 100644
+--- a/bsd/dev/ishtar_charger.c
++++ b/bsd/dev/ishtar_charger.c
+@@ -71,6 +71,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -651,6 +652,7 @@ sc_control(struct sc_snap *s)
+ static void
+ sc_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-sc");
+ 	struct sc_snap s;
+ 	unsigned period = sc_mode == 2 ? SC_CTL_PERIOD_MS : SC_RO_PERIOD_MS;
+ 	unsigned since_log = SC_LOG_PERIOD_MS;
+diff --git a/bsd/dev/ishtar_cpufreq.c b/bsd/dev/ishtar_cpufreq.c
+index fce7576..8c00b91 100644
+--- a/bsd/dev/ishtar_cpufreq.c
++++ b/bsd/dev/ishtar_cpufreq.c
+@@ -91,6 +91,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -530,6 +531,7 @@ cf_amp_setup(void)
+ static void
+ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-cf");
+ 	/* After the SMP bring-up: every selected CPU must be alive (their OSM domains powered). */
+ 	cf_ncpus = ml_get_topology_info()->num_cpus;
+ 	if (cf_ncpus > 8) {
+@@ -663,6 +665,7 @@ cf8_load(unsigned d, uint64_t wall)
+ static void
+ cf8_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-cf8");
+ 	uint64_t last = mach_absolute_time();
+ 	uint32_t ticks = 0;
+ 	for (;;) {
+diff --git a/bsd/dev/ishtar_keys.c b/bsd/dev/ishtar_keys.c
+index 0d79033..8e586e1 100644
+--- a/bsd/dev/ishtar_keys.c
++++ b/bsd/dev/ishtar_keys.c
+@@ -9,6 +9,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -92,6 +93,7 @@ keys_wait(void)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-keys");
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
+ 	(void)arg;
+diff --git a/bsd/dev/ishtar_push.c b/bsd/dev/ishtar_push.c
+index 9093a74..11c1301 100644
+--- a/bsd/dev/ishtar_push.c
++++ b/bsd/dev/ishtar_push.c
+@@ -14,6 +14,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/kpi_socket.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+@@ -323,6 +324,7 @@ push_conn(socket_t so, char *buf)
+ static void
+ push_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-push");
+ 	socket_t ls = NULL;
+ 	struct sockaddr_in sin = { .sin_len = sizeof(sin), .sin_family = AF_INET, .sin_port = htons(5141) };
+ 	int on = 1;
+diff --git a/bsd/dev/ishtar_sample.c b/bsd/dev/ishtar_sample.c
+index 379259c..e7c07e7 100644
+--- a/bsd/dev/ishtar_sample.c
++++ b/bsd/dev/ishtar_sample.c
+@@ -14,6 +14,7 @@
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
+ #include <kern/task.h>
+@@ -63,6 +64,7 @@ ishtar_sample_proc(proc_t p, __unused void *arg)
+ static void
+ ishtar_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-sample");
+ 	static int chan;
+ 	if (!PE_parse_boot_argn("ishtarsample", ishtar_sample_names, sizeof(ishtar_sample_names))) {
+ 		strlcpy(ishtar_sample_names, "SpringBoard,backboardd", sizeof(ishtar_sample_names));
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 0666ede..d45beb7 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -19,6 +19,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -1049,6 +1050,7 @@ touch_se_init(void)
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-touch");
+ 	unsigned delay_s = 45;
+ 	(void)arg;
+ 	(void)result;
+@@ -2025,6 +2027,7 @@ static vm_offset_t fr_tlmm;
+ static void
+ fts_watch(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-fts-watch");
+ 	for (;;) {
+ 		delay(2000000);
+ 		printf("ISHTAR TOUCH: wd stage %u polls %u reads %u events %u fails %u irq-low %u | irq %u tx_wp %u rx_wp %u ev_rp %u "
+@@ -2196,6 +2199,7 @@ ishtar_touch_probe(int stage)
+ static void
+ ishtar_touch_probe_thread(void *arg, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-touch-probe");
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline((uint32_t)(uintptr_t)arg, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&tp_pace_ms, THREAD_UNINT, deadline);
+diff --git a/bsd/dev/ishtar_ufs.c b/bsd/dev/ishtar_ufs.c
+index 7900d8a..3bec2b1 100644
+--- a/bsd/dev/ishtar_ufs.c
++++ b/bsd/dev/ishtar_ufs.c
+@@ -31,6 +31,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/buf.h>
+ #include <sys/conf.h>
+ #include <sys/disk.h>
+@@ -1308,6 +1309,7 @@ struct ishtar_log_header {
+ static void
+ ishtar_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-log");
+ 	uint64_t base = su.first_block + su.nblocks - ISHTAR_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+@@ -1451,6 +1453,7 @@ st_verify(const uint32_t *b, uint64_t blk, uint32_t nblk, uint32_t seed, uint64_
+ static void
+ ishtar_ufs_selftest_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-ufs-selftest");
+ 	uint32_t mib = 0;
+ 	PE_parse_boot_argn("ufsselftest", &mib, sizeof(mib));
+ 	if (mib == 0 || mib > 16 || !su.writable || su.nblocks < 2 * ISHTAR_LOG_BLOCKS + 8192) {
+@@ -1588,6 +1591,7 @@ ishtar_ufs_sync_all(void)
+ static void
+ ishtar_ufs_syncer_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-ufs-syncer");
+ 	uint32_t runs = 0;
+ 	uint64_t bad_mark = 0;
+ 
+diff --git a/bsd/dev/ishtar_usb.c b/bsd/dev/ishtar_usb.c
+index d987cd4..6f93e97 100644
+--- a/bsd/dev/ishtar_usb.c
++++ b/bsd/dev/ishtar_usb.c
+@@ -13,6 +13,7 @@
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -752,6 +753,7 @@ struct ud_rtmsg {
+ static void
+ ud_route_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-ud-route");
+ 	struct ud_rtmsg m;
+ 	socket_t so = NULL;
+ 	errno_t err;
+@@ -1016,6 +1018,7 @@ ud_event(uint32_t ev)
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-ud");
+ 	uint32_t ticks = 0;
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+@@ -1134,6 +1137,7 @@ reconnect:
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-ud-log");
+ 	static char chunk[1400];
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+diff --git a/bsd/dev/ishtar_wlan.c b/bsd/dev/ishtar_wlan.c
+index 829f079..d850521 100644
+--- a/bsd/dev/ishtar_wlan.c
++++ b/bsd/dev/ishtar_wlan.c
+@@ -38,6 +38,7 @@ int wl_host_read(const char *part, uint64_t off, void *dst, uint64_t len);
+ #elif defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -2785,6 +2786,7 @@ out_clocks:
+ static void
+ wl_thread(void *arg, wait_result_t wr)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-wl");
+ 	(void)arg;
+ 	(void)wr;
+ 	printf("ISHTAR WLAN: stage %u starts in %u s\n", wl.stage, wl.delay_s);
+diff --git a/iokit/Kernel/arm/IshtarDpu.cpp b/iokit/Kernel/arm/IshtarDpu.cpp
+index bc19e96..dceeb47 100644
+--- a/iokit/Kernel/arm/IshtarDpu.cpp
++++ b/iokit/Kernel/arm/IshtarDpu.cpp
+@@ -440,6 +440,7 @@ ishtar_dpu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova)
+ static void
+ ishtar_dpu_probe_thread(void *, wait_result_t)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-dpu-probe");
+ 	IOSleep(90000);
+ 	/* the context bank of 0x1c00 again, for the walk (same decoding as ishtar_smmu_probe_sid) */
+ 	vm_offset_t smmu = ml_io_map(0x15000000, 0x100000);
+diff --git a/iokit/Kernel/arm/IshtarFramebuffer.cpp b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+index 89a80fb..f71d7b1 100644
+--- a/iokit/Kernel/arm/IshtarFramebuffer.cpp
++++ b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+@@ -1076,6 +1076,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if (count == 1) {
++		thread_set_thread_name(current_thread(), "ishtar-fb-workloop");     /* the spinner hunt: name the work loop's thread */
++	}
+ 	if (fb->fDpuZc) {
+ 		fb->dpuZcRetire(false);
+ 	}
+@@ -3538,6 +3541,7 @@ ishtar_scale_band(const IshtarScaleJob &j, uint32_t band, uint32_t bands, uint32
+ static void
+ ishtar_scale_worker(void *arg, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-scale-worker");
+ 	uint32_t band = (uint32_t)(uintptr_t)arg, seen = 0;
+ 	uint32_t *rowIn = (uint32_t *)IOMallocData(4096 * sizeof(uint32_t)), *rowOut = (uint32_t *)IOMallocData(4096 * sizeof(uint32_t));
+ 	for (;;) {
+diff --git a/iokit/Kernel/arm/IshtarPlatformExpert.cpp b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+index 01686b7..751d4d8 100644
+--- a/iokit/Kernel/arm/IshtarPlatformExpert.cpp
++++ b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+@@ -40,6 +40,7 @@ OSDefineMetaClassAndStructors(IshtarPlatformExpert, IODTPlatformExpert);
+ static void
+ ishtar_alive_thread(void *arg, wait_result_t wr __unused)
+ {
++	thread_set_thread_name(current_thread(), "ishtar-alive");
+ 	uint32_t secs = (uint32_t)(uintptr_t)arg;
+ 	for (uint32_t n = 1; n * secs <= 60; n++) {
+ 		IOSleep(secs * 1000);
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index c9535d7..30b4790 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -783,7 +783,10 @@ ishtar_processor_current_name(int cpu, char *out, size_t size)
+ 	thread_t thread = processor->active_thread;
+ 	thread_get_thread_name(thread, out);
+ 	if (!out[0]) {
+-		snprintf(out, size, "c%llx", (unsigned long long)VM_KERNEL_UNSLIDE((uintptr_t)thread->continuation));
++		extern uintptr_t ishtar_kthread_entry(uint64_t tid);
++		const uintptr_t entry = ishtar_kthread_entry(thread->thread_id);
++		snprintf(out, size, entry ? "k%llx" : "c%llx",
++		    (unsigned long long)(entry ? entry : VM_KERNEL_UNSLIDE((uintptr_t)thread->continuation)));
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index ea99a0f..d8e11e0 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -1935,6 +1935,29 @@ kernel_thread_create(
+ 	return result;
+ }
+ 
++/* ishtar: every kernel thread's id and entry function (fixed table, no allocation), for the CPU probe's unnamed threads. */
++#define ISHTAR_KTHREADS 512
++static struct { uint64_t tid; uintptr_t fn; } ishtar_kthreads[ISHTAR_KTHREADS];
++static uint32_t ishtar_kthread_next;
++static void
++ishtar_kthread_note(uint64_t tid, thread_continue_t fn)
++{
++	const uint32_t i = os_atomic_inc_orig(&ishtar_kthread_next, relaxed) % ISHTAR_KTHREADS;
++	ishtar_kthreads[i].fn = (uintptr_t)fn;
++	ishtar_kthreads[i].tid = tid;
++}
++uintptr_t ishtar_kthread_entry(uint64_t tid);
++uintptr_t
++ishtar_kthread_entry(uint64_t tid)
++{
++	for (uint32_t i = 0; i < ISHTAR_KTHREADS; i++) {
++		if (ishtar_kthreads[i].tid == tid) {
++			return VM_KERNEL_UNSLIDE(ishtar_kthreads[i].fn);
++		}
++	}
++	return 0;
++}
++
+ kern_return_t
+ kernel_thread_start_priority(
+ 	thread_continue_t       continuation,
+@@ -1951,6 +1974,7 @@ kernel_thread_start_priority(
+ 	}
+ 
+ 	*new_thread = thread;
++	ishtar_kthread_note(thread->thread_id, continuation);
+ 
+ 	thread_mtx_lock(thread);
+ 	thread_start(thread);

@@ -1,0 +1,1610 @@
+diff --git a/bsd/dev/ishtar_push.c b/bsd/dev/ishtar_push.c
+index cc406af..6ee277c 100644
+--- a/bsd/dev/ishtar_push.c
++++ b/bsd/dev/ishtar_push.c
+@@ -2,9 +2,11 @@
+  * File push over the USB Ethernet link (boot-arg ishtarpush=1, default off): a TCP server on 192.168.7.2:5141 that takes
+  * files and directories from the Mac (192.168.7.1 only, scripts/push.py) and writes them into the live iOS root, so a
+  * userspace component (the Metal plugin) can be replaced without rebuilding and reflashing userdata.
+- * Entry: "ISHP", type ('D' directory, 'F' file, 'R' remove a file, 'G' get a file, 'L' list a directory, 'X' end), 3 zero bytes, u32 mode, u32 path length, u64 data length
++ * Entry: "ISHP", type ('D' directory, 'F' file, 'R' remove a file, 'G' get a file, 'L' list a directory, 'S' set a knob, 'X' end), 3 zero bytes, u32 mode, u32 path length, u64 data length
+  * (all little endian), the path, the data. Each entry is answered with a u32 errno. Paths must be absolute, without "..",
+  * under /System/Library/Extensions/ or /private/var/. 'G' (read) and 'L' (one "<d_type> <name>" line per entry), /private/var/ only, answer u32 errno, u64 size, the bytes.
++ * 'S': the path is a knob name a driver registered (ishtar_knob_register), the data length its new value (answer: errno);
++ * "?" lists them as 'L' does. Experiments change a setting live instead of waiting for a kernel build.
+  * ponytail: one connection at a time, no symlinks or ownership changes; add them when a push needs them.
+  */
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+@@ -93,6 +95,34 @@ push_file(socket_t so, const char *path, uint32_t mode, uint64_t size, char *buf
+ 	return err;
+ }
+ 
++/* Knobs: named 32-bit settings of other drivers, set live over the push link ('S'). */
++#define PUSH_KNOBS 32
++static struct { const char *name; volatile uint32_t *value; } push_knobs[PUSH_KNOBS];
++static uint32_t push_nknobs;
++
++void ishtar_knob_register(const char *name, volatile uint32_t *value);
++void
++ishtar_knob_register(const char *name, volatile uint32_t *value)
++{
++	if (push_nknobs < PUSH_KNOBS) {
++		push_knobs[push_nknobs].name = name;
++		push_knobs[push_nknobs++].value = value;
++	}
++}
++
++static int
++push_knob_set(const char *name, uint64_t value)
++{
++	for (uint32_t i = 0; i < push_nknobs; i++) {
++		if (!strcmp(push_knobs[i].name, name)) {
++			printf("ISHTAR PUSH: knob %s %u -> %llu\n", name, *push_knobs[i].value, value);
++			*push_knobs[i].value = (uint32_t)value;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
+ static void
+ push_send(socket_t so, const void *data, size_t len)
+ {
+@@ -206,6 +236,21 @@ push_conn(socket_t so, char *buf)
+ 				err = ishtar_mkdir(path, h.mode & 07777);
+ 				err = err == EEXIST ? 0 : err;
+ 			}
++		} else if (h.type == 'S') {
++			if (!strcmp(path, "?")) {
++				char *text = buf + PUSH_CHUNK / 2;
++				size_t len = 0;
++				for (uint32_t i = 0; i < push_nknobs && len < PUSH_CHUNK / 2 - 64; i++) {
++					len += (size_t)snprintf(text + len, PUSH_CHUNK / 2 - len, "%s %u\n", push_knobs[i].name, *push_knobs[i].value);
++				}
++				uint32_t e = 0;
++				uint64_t size = len;
++				push_send(so, &e, sizeof(e));
++				push_send(so, &size, sizeof(size));
++				push_send(so, text, len);
++				continue;
++			}
++			err = push_knob_set(path, h.size);
+ 		} else if (h.type == 'L') {
+ 			push_list(so, path, buf);
+ 			continue;
+diff --git a/iokit/Kernel/arm/IshtarDpu.cpp b/iokit/Kernel/arm/IshtarDpu.cpp
+new file mode 100644
+index 0000000..52c0ce8
+--- /dev/null
++++ b/iokit/Kernel/arm/IshtarDpu.cpp
+@@ -0,0 +1,916 @@
++/*
++ * SM8550 display controller (DPU 9.0) for the ishtar framebuffer: page flipping on the path the bootloader set up.
++ *
++ * Ground truth: the mainline catalog dpu_9_0_sm8550.h (block offsets from the DPU top at 0xae01000), dpu_hw_ctl.c /
++ * dpu_hw_sspp.c / dpu_hw_intf.c (register offsets, CTL flush bits) and the dpu-3 register dump on the phone:
++ * MDSS 9.0.0, CTL0 drives INTF_1 (DSI0, command mode, tear check on, autorefresh 0x80000001 = a fetch on every TE),
++ * DSC0+DSC1, VIG0 and VIG1 each fetch 720 of the 1440 columns of the UEFI framebuffer (0xb8000000, stride 5760).
++ *
++ * With autorefresh on, a new source address in the pipes plus one CTL flush is latched at the next frame start: both
++ * halves switch together and the panel never shows a frame that is being drawn. The UEFI display carve-out
++ * (ishtarPkg MemoryMapLib: 0xb8000000 + 0x2b00000) holds the boot buffer and one back buffer of 1440x3200x4.
++ *
++ * Interface for AppleCLCD (IshtarFramebuffer.cpp): ishtar_dpu_init once, then per frame ishtar_dpu_wait_latch,
++ * draw into ishtar_dpu_buffer(back), ishtar_dpu_flip(back). ishtar_dpu_restore puts the boot buffer back (panic).
++ * ponytail: the path is used as the bootloader left it (no mode set, no DSC or scaler programming); the hardware
++ * scaler, the TE interrupt and DSI commands (power, brightness, 120 Hz) come next in this file.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++namespace {
++constexpr uint64_t kMdssPa = 0x0ae00000, kDpuTopPa = 0x0ae01000, kDpuBytes = 0x83000;
++constexpr uint64_t kCarveoutBytes = 0x02b00000;
++constexpr uint32_t kCtlBase = 0x15000, kCtlStride = 0x1000, kCtlCount = 6;
++constexpr uint32_t kCtlFlush = 0x018, kCtlIntfActive = 0x0f4, kCtlFlushCtl = 1u << 17;
++constexpr uint32_t kSsppSrc0 = 0x14, kSsppStride0 = 0x24;
++/* catalog SSPP base and dpu_hw_ctl.c flush bit */
++constexpr struct { const char *name; uint32_t base, flush; } kPipes[] = {
++	{"VIG0", 0x04000, 1u << 0}, {"VIG1", 0x06000, 1u << 1}, {"VIG2", 0x08000, 1u << 2}, {"VIG3", 0x0a000, 1u << 18},
++	{"DMA0", 0x24000, 1u << 11}, {"DMA1", 0x26000, 1u << 12}, {"DMA2", 0x28000, 1u << 24}, {"DMA3", 0x2a000, 1u << 25},
++	{"DMA4", 0x2c000, 1u << 13}, {"DMA5", 0x2e000, 1u << 14},
++};
++constexpr uint32_t kMaxLive = 4;
++
++struct {
++	vm_offset_t dpu;
++	uint32_t ctl, flush;            /* the CTL that drives the panel; the flush bits of its pipes plus CTL */
++	uint32_t live, pipe[kMaxLive], delta[kMaxLive], bootSrc[kMaxLive];
++	uint64_t pa[2];
++	uintptr_t va[2];
++	IOMemoryMap *map;
++	uint32_t front, latchTimeouts, flips, latchWaits, lastIntfLine, underruns;
++	uint64_t latchWaitAbs;
++	bool ready;
++} d;
++
++inline uint32_t rd(uint32_t off) {return *(volatile uint32_t *)(d.dpu + off);}
++inline void wr(uint32_t off, uint32_t v) {*(volatile uint32_t *)(d.dpu + off) = v;}
++}
++
++extern "C" bool
++ishtar_dpu_init(uint64_t fbPa, uintptr_t fbVa, uint32_t height, uint32_t stride)
++{
++	vm_offset_t mdss = ml_io_map(kMdssPa, 0x1000);
++	d.dpu = ml_io_map(kDpuTopPa, kDpuBytes);
++	if (!mdss || !d.dpu) {
++		IOLog("ISHTAR DPU: map failed\n");
++		return false;
++	}
++	const uint32_t version = *(volatile uint32_t *)mdss;
++	if ((version >> 28) != 9) {
++		IOLog("ISHTAR DPU: MDSS 0x%08x is not DPU 9 (SM8550)\n", version);
++		return false;
++	}
++	for (d.ctl = 0; d.ctl < kCtlCount && !rd(kCtlBase + d.ctl * kCtlStride + kCtlIntfActive); d.ctl++) {
++	}
++	if (d.ctl == kCtlCount) {
++		IOLog("ISHTAR DPU: no CTL drives an interface\n");
++		return false;
++	}
++	d.flush = kCtlFlushCtl;
++	for (uint32_t i = 0; i < sizeof(kPipes) / sizeof(kPipes[0]) && d.live < kMaxLive; i++) {
++		const uint32_t src = rd(kPipes[i].base + kSsppSrc0);
++		if (src >= fbPa && src < fbPa + stride) {      /* fetches a part of the first row: a column range of the frame */
++			d.pipe[d.live] = i;
++			d.delta[d.live] = src - (uint32_t)fbPa;
++			d.bootSrc[d.live++] = src;
++			d.flush |= kPipes[i].flush;
++		}
++	}
++	const uint64_t frame = (uint64_t)stride * height, slot = (frame + 0xfffff) & ~0xfffffull;
++	if (!d.live || rd(kPipes[d.pipe[0]].base + kSsppStride0) != stride || slot + frame > kCarveoutBytes) {
++		IOLog("ISHTAR DPU: unexpected boot path (%u pipes, stride 0x%x, frame 0x%llx)\n", d.live,
++		    d.live ? rd(kPipes[d.pipe[0]].base + kSsppStride0) : 0, frame);
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fbPa + slot, (IOByteCount)frame, kIODirectionInOut);
++	d.map = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
++	OSSafeReleaseNULL(md);
++	if (!d.map) {
++		IOLog("ISHTAR DPU: back buffer map failed\n");
++		return false;
++	}
++	d.pa[0] = fbPa;
++	d.va[0] = fbVa;
++	d.pa[1] = fbPa + slot;
++	d.va[1] = (uintptr_t)d.map->getVirtualAddress();
++	memcpy((void *)d.va[1], (const void *)fbVa, (size_t)frame);
++	d.front = 0;
++	d.ready = true;
++	IOLog("ISHTAR DPU: MDSS 0x%08x, CTL%u -> intf 0x%x, %u pipes (%s%s%s +0x%x), buffers 0x%llx 0x%llx, flush 0x%x\n",
++	    version, d.ctl, rd(kCtlBase + d.ctl * kCtlStride + kCtlIntfActive), d.live, kPipes[d.pipe[0]].name,
++	    d.live > 1 ? "+" : "", d.live > 1 ? kPipes[d.pipe[1]].name : "", d.live > 1 ? d.delta[1] : 0, d.pa[0], d.pa[1], d.flush);
++	return true;
++}
++
++extern "C" uintptr_t
++ishtar_dpu_buffer(uint32_t idx)
++{
++	return d.ready && idx < 2 ? d.va[idx] : 0;
++}
++
++extern "C" uint32_t
++ishtar_dpu_front(void)
++{
++	return d.front;
++}
++
++/* The last flip is latched once the hardware cleared its flush bits (next frame start); up to 25 ms. */
++extern "C" void
++ishtar_dpu_wait_latch(void)
++{
++	const uint32_t flushReg = kCtlBase + d.ctl * kCtlStride + kCtlFlush;
++	const uint64_t t0 = mach_absolute_time();
++	for (uint32_t i = 0; d.ready && i < 1250; i++) {
++		if (!(rd(flushReg) & d.flush)) {
++			if (i) {
++				d.latchWaits++;
++				d.latchWaitAbs += mach_absolute_time() - t0;
++			}
++			return;
++		}
++		IODelay(20);
++	}
++	if (d.ready && d.latchTimeouts++ == 0) {
++		IOLog("ISHTAR DPU: flush 0x%x not latched within 25 ms\n", rd(flushReg));
++	}
++}
++
++/* The last flush has latched (non-blocking). */
++extern "C" bool
++ishtar_dpu_latched(void)
++{
++	return !d.ready || !(rd(kCtlBase + d.ctl * kCtlStride + kCtlFlush) & d.flush);
++}
++
++static void
++ishtar_dpu_scan(uint64_t pa, bool boot)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the frame's write-combined stores land first */
++	for (uint32_t i = 0; i < d.live; i++) {
++		wr(kPipes[d.pipe[i]].base + kSsppSrc0, boot ? d.bootSrc[i] : (uint32_t)pa + d.delta[i]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(kCtlBase + d.ctl * kCtlStride + kCtlFlush, d.flush);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++extern "C" void
++ishtar_dpu_flip(uint32_t idx)
++{
++	if (d.ready && idx < 2) {
++		ishtar_dpu_scan(d.pa[idx], false);
++		d.front = idx;
++		d.flips++;
++	}
++}
++
++extern "C" void ishtar_dpu_scan_panel(void);
++extern "C" bool ishtar_dpu_zc_on(void);
++
++extern "C" void
++ishtar_dpu_restore(void)
++{
++	if (ishtar_dpu_zc_on()) {
++		ishtar_dpu_scan_panel();
++		return;
++	}
++	if (d.ready) {
++		ishtar_dpu_scan(0, true);
++		d.front = 0;
++	}
++}
++
++/*
++ * The panel's real frame timing (command mode): INTF_1's tear check counts the panel's lines from the TE pulse. +0x294 the
++ * count it starts from at TE, +0x298 the running count (low 16 bits), +0x2b0 the display DMA's write count, +0x2b4 autorefresh.
++ * Calibration (thread context, read only): watch four wraps of the counter, take the frame and line time from them. Then
++ * ishtar_dpu_next_frame_ns() says when the next frame begins, so CoreAnimation's vsyncs can follow the panel instead of a
++ * free-running timer (57.7/s against the panel's own rate: a missed frame every couple of dozen).
++ * Calibration after another XNU port's command-mode scan sync.
++ */
++static struct {
++	bool ok;
++	uint32_t init, lines;
++	uint64_t lineNs, frameNs;
++} te;
++
++extern "C" bool
++ishtar_dpu_te_calibrate(void)
++{
++	if (!d.ready || te.ok) {
++		return te.ok;
++	}
++	const uint32_t init = rd(0x35294) & 0xffff, autoref = rd(0x352b4);
++	IOLog("ISHTAR DPU: te: en 0x%x cfg 0x%x height 0x%x init %u count %u wr %u auto 0x%x\n", rd(0x35284), rd(0x35288),
++	    rd(0x3528c), init, rd(0x35298) & 0xffff, rd(0x352b0) & 0xffff, autoref);
++	if (autoref != 0x80000001u || init == 0) {
++		return false;
++	}
++	uint64_t start = mach_absolute_time(), prevT = start, firstWrap = 0, lastWrap = 0, lineT = 0, lineN = 0, ns;
++	uint32_t prev = rd(0x35298) & 0xffff, wraps = 0;
++	while (wraps < 5) {
++		IODelay(50);
++		const uint32_t raw = rd(0x35298) & 0xffff;
++		const uint64_t now = mach_absolute_time();
++		absolutetime_to_nanoseconds(now - start, &ns);
++		if (ns > 200000000ull || raw < init) {
++			IOLog("ISHTAR DPU: te: no usable count (raw %u init %u after %llu us)\n", raw, init, ns / 1000);
++			return false;
++		}
++		if (raw < prev) {
++			if (wraps++ == 0) {
++				firstWrap = now;
++			}
++			lastWrap = now;
++		} else if (raw > prev) {
++			uint64_t dt;
++			absolutetime_to_nanoseconds(now - prevT, &dt);
++			lineT += dt;
++			lineN += raw - prev;
++		}
++		prev = raw;
++		prevT = now;
++	}
++	absolutetime_to_nanoseconds(lastWrap - firstWrap, &ns);
++	te.frameNs = ns / (wraps - 1);
++	te.lineNs = lineN ? lineT / lineN : 0;
++	if (!te.lineNs || te.frameNs < NSEC_PER_SEC / 150 || te.frameNs > NSEC_PER_SEC / 20) {
++		IOLog("ISHTAR DPU: te: implausible frame %llu ns line %llu ns\n", te.frameNs, te.lineNs);
++		return false;
++	}
++	te.init = init;
++	te.lines = (uint32_t)(te.frameNs / te.lineNs);
++	te.ok = true;
++	IOLog("ISHTAR DPU: te: %llu.%03llu Hz, %llu ns/line, %u lines a frame\n", NSEC_PER_SEC / te.frameNs,
++	    (NSEC_PER_SEC * 1000 / te.frameNs) % 1000, te.lineNs, te.lines);
++	return true;
++}
++
++/*
++ * DSI0 commands to the panel (command DMA), for the refresh rate. Registers: MSM DSI 6G (freedreno dsi.xml, MIT), at
++ * 0xae94000 + 4 (Linux io_offset DSI_6G_REG_SHIFT): CTRL 0x0, CMD_DMA_CTRL 0x38, DMA_BASE 0x44, DMA_LEN 0x48, TRIG_CTRL 0x80
++ * (DMA_TRIGGER bits 2:0, 4 = software), TRIG_DMA 0x8c, INTR_CTRL 0x10c (bit 0 CMD_DMA_DONE, write 1 to clear). In memory
++ * one packet: length low, length high, data type, flags (bit 7 last, bit 6 long), the payload, 0xff to a word (Linux
++ * dsi_cmd_dma_add). UEFI left the host configured for command mode; this only fills the buffer and triggers.
++ * Knob dsi.hz=120: the stock DT's timing@wqhd_120hz switch command (DCS long writes 26 02 / 2f 02 / f0 55 aa 52 08 00 /
++ * bc 00 / 2c 00), then the TE timing is measured again. Default at boot (boot-arg ishtardsihz=0: stay at 60 Hz).
++ * One way: back to 60 Hz is a reboot with ishtardsihz=0.
++ */
++extern "C" void ishtar_knob_register(const char *name, volatile uint32_t *value);
++static volatile uint32_t gDsiHz;
++static vm_offset_t gDsi, gDsiBuf;
++static uint64_t gDsiBufPa;
++static bool gDsiOk;
++
++static uint32_t
++dsi_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(gDsi + 4 + off);
++}
++
++static void
++dsi_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(gDsi + 4 + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* frameEnd: where the boot buffer ends; gapEnd: where the pool begins */
++static void
++ishtar_dsi_probe(uint64_t frameEnd, uint64_t gapEnd)
++{
++	gDsi = ml_io_map(0x0ae94000, 0x1000);
++	if (!gDsi) {
++		return;
++	}
++	const uint32_t ctrl = dsi_rd(0x0), dma = dsi_rd(0x38), trig = dsi_rd(0x80);
++	IOLog("ISHTAR DSI: version 0x%08x ctrl 0x%08x cmd_dma_ctrl 0x%08x trig_ctrl 0x%08x dma_base 0x%08x dma_len 0x%x intr 0x%08x "
++	    "cmd_cfg0 0x%08x cmd_cfg1 0x%08x\n", *(volatile uint32_t *)gDsi, ctrl, dma, trig, dsi_rd(0x44), dsi_rd(0x48), dsi_rd(0x10c),
++	    dsi_rd(0x3c), dsi_rd(0x40));
++	/* command buffer: the gap between the boot buffer and the pool (carve-out, 1:1 through the display SMMU) */
++	if (gapEnd - frameEnd >= 0x1000) {
++		gDsiBufPa = gapEnd - 0x1000;
++		gDsiBuf = ml_io_map(gDsiBufPa, 0x1000);
++	}
++	gDsiOk = gDsiBuf && (ctrl & 0x5) == 0x5 && (trig & 7) == 4;
++	IOLog("ISHTAR DSI: command buffer 0x%llx; sending %s\n", gDsiBufPa, gDsiOk ? "possible" :
++	    "refused (needs ctrl enable+cmd mode, software DMA trigger, a buffer)");
++	ishtar_knob_register("dsi.hz", &gDsiHz);
++	gDsiHz = 120;   /* the panel's 120 Hz mode at boot (tested live on hz-1: TE 120.59 Hz); ishtardsihz=0 keeps 60 */
++	PE_parse_boot_argn("ishtardsihz", (void *)&gDsiHz, sizeof(gDsiHz));
++}
++
++/* One DCS long write; true when the host reported the DMA done. */
++static bool
++ishtar_dsi_dcs(const uint8_t *p, uint32_t n)
++{
++	volatile uint8_t *b = (volatile uint8_t *)gDsiBuf;
++	const uint32_t len = (4 + n + 3) & ~3u;
++	b[0] = (uint8_t)n;
++	b[1] = (uint8_t)(n >> 8);
++	b[2] = 0x39;
++	b[3] = 0xc0;
++	for (uint32_t i = 0; i < len - 4; i++) {
++		b[4 + i] = i < n ? p[i] : 0xff;
++	}
++	dsi_wr(0x10c, dsi_rd(0x10c) | 1);      /* clear a stale DMA done */
++	dsi_wr(0x44, (uint32_t)gDsiBufPa);
++	dsi_wr(0x48, len);
++	dsi_wr(0x8c, 1);
++	for (int i = 0; i < 2000; i++) {
++		if (dsi_rd(0x10c) & 1) {
++			dsi_wr(0x10c, dsi_rd(0x10c) | 1);
++			return true;
++		}
++		IODelay(10);
++	}
++	return false;
++}
++
++/* From the vsync tick: apply dsi.hz once. */
++extern "C" void
++ishtar_dsi_poll(void)
++{
++	static bool done;
++	if (done || gDsiHz != 120) {
++		return;
++	}
++	done = true;
++	if (!gDsiOk) {
++		IOLog("ISHTAR DSI: 120 Hz refused (see the probe line)\n");
++		return;
++	}
++	static const uint8_t c0[] = {0x26, 0x02}, c1[] = {0x2f, 0x02}, c2[] = {0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00}, c3[] = {0xbc, 0x00},
++	    c4[] = {0x2c, 0x00};
++	const struct { const uint8_t *p; uint32_t n; } seq[] = {{c0, 2}, {c1, 2}, {c2, 6}, {c3, 2}, {c4, 2}};
++	bool ok[5];
++	for (int i = 0; i < 5; i++) {
++		ok[i] = ishtar_dsi_dcs(seq[i].p, seq[i].n);
++	}
++	IOLog("ISHTAR DSI: 120 Hz switch sent, done %d%d%d%d%d, intr 0x%08x\n", ok[0], ok[1], ok[2], ok[3], ok[4], dsi_rd(0x10c));
++	te.ok = false;
++	IODelay(50000);
++	(void)ishtar_dpu_te_calibrate();
++}
++
++/* Nanoseconds until the panel's next frame begins; 0 = not calibrated. */
++extern "C" uint64_t
++ishtar_dpu_next_frame_ns(void)
++{
++	if (!te.ok) {
++		return 0;
++	}
++	const uint32_t raw = rd(0x35298) & 0xffff;
++	uint32_t line = raw >= te.init ? raw - te.init : 0;
++	line = line < te.lines ? line : te.lines - 1;
++	return (uint64_t)(te.lines - line) * te.lineNs;
++}
++
++extern "C" uint64_t
++ishtar_dpu_frame_ns(void)
++{
++	return te.ok ? te.frameNs : 0;
++}
++
++/* With the framebuffer's periodic stats line (ishtarfb_statlog): flips, waits for the latch, timeouts, the front buffer. */
++extern "C" void
++ishtar_dpu_log(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(d.latchWaitAbs, &ns);
++	/* INTF_1 interrupt status since the last line (DPU 7+ layout, dpu_hw_interrupts.c): underruns would show here */
++	const uint32_t en = rd(0x351c0), st = rd(0x351c4), tear = rd(0x35804);
++	wr(0x351c8, st);
++	wr(0x35808, tear);
++	/* MDP_SSPP_TOP0_INTR (top +0x10 en / +0x14 status / +0x18 clear): INTF_1 underrun is bit 26, its vsync bit 27 */
++	const uint32_t top = rd(0x014);
++	wr(0x018, top);
++	if (top & (1u << 26)) {
++		d.underruns++;
++	}
++	IOLog("ISHTAR DPU: flips %u latch waits %u (%llu us) timeouts %u front %u pipes %u ctl%u flush 0x%x | intf1 intr en 0x%x status 0x%x tear 0x%x | top intr 0x%08x underrun windows %u\n",
++	    d.flips, d.latchWaits, ns / 1000, d.latchTimeouts, d.front, d.live, d.ctl, d.flush, en, st, tear, top, d.underruns);
++}
++
++/*
++ * Zero-copy ground truth (boot-arg ishtardpuprobe=1, read-only, 90 s after start so it reaches the USB log): the apps
++ * SMMU set-up of the display streams (0x1c00 unsecure, 0x1c01 secure: stock DT smmu_sde_*), a walk of the stream's
++ * page tables for the UEFI framebuffer and for kernel RAM, and the live geometry and scaler state of the two VIG pipes.
++ * Single 32-bit reads only (a block dump of the DPU top stalled the bus once).
++ */
++extern "C" int ishtar_smmu_probe_sid(unsigned sid, unsigned level);   /* bsd/dev/ishtar_smmu.c */
++extern "C" uint64_t gPhysBase;
++
++static uint64_t __attribute__((unused))
++ishtar_dpu_phys64(uint64_t pa)
++{
++	vm_offset_t va = ml_io_map(pa & ~0x3fffull, 0x4000);
++	return va ? *(volatile uint64_t *)(va + (pa & 0x3ff8)) : ~0ull;   /* ponytail: the probe's mappings stay */
++}
++
++static void __attribute__((unused))
++ishtar_dpu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova)
++{
++	const unsigned t0sz = tcr & 0x3f, vabits = 64 - t0sz;
++	unsigned level = vabits > 39 ? 0 : (vabits > 30 ? 1 : 2);
++	uint64_t table = ttbr & 0x0000fffffffff000ull;
++	for (; level < 4; level++) {
++		const unsigned shift = 39 - 9 * level;
++		const uint64_t desc = ishtar_dpu_phys64(table + ((iova >> shift) & 0x1ff) * 8);
++		IOLog("ISHTAR DPU: walk 0x%llx L%u desc 0x%016llx\n", iova, level, desc);
++		if (!(desc & 1) || level == 3 || !(desc & 2)) {      /* invalid, page, or block */
++			if ((desc & 1)) {
++				const uint64_t mask = (1ull << shift) - 1;
++				IOLog("ISHTAR DPU: walk 0x%llx -> pa 0x%llx\n", iova, (desc & 0x0000fffffffff000ull & ~mask) | (iova & mask));
++			}
++			return;
++		}
++		table = desc & 0x0000fffffffff000ull;
++	}
++}
++
++static void
++ishtar_dpu_probe_thread(void *, wait_result_t)
++{
++	IOSleep(90000);
++	/* the context bank of 0x1c00 again, for the walk (same decoding as ishtar_smmu_probe_sid) */
++	vm_offset_t smmu = ml_io_map(0x15000000, 0x100000);
++	IOLog("ISHTAR DPU: probe start\n");
++	if (smmu) {
++		const uint32_t id0 = *(volatile uint32_t *)(smmu + 0x20), id1 = *(volatile uint32_t *)(smmu + 0x24);
++		const unsigned pgshift = (id1 >> 31) ? 16 : 12;
++		const uint32_t cb0 = (1u << (((id1 >> 28) & 7) + 1)) << pgshift;
++		for (unsigned i = 0; i < (id0 & 0xff) && i < 128; i++) {
++			const uint32_t smr = *(volatile uint32_t *)(smmu + 0x800 + 4 * i);
++			const uint32_t mask = (smr >> 16) & 0x7fff;
++			if (!(smr & (1u << 31)) || ((smr ^ 0x1c00) & ~mask & 0x7fff)) {
++				continue;
++			}
++			const uint32_t s2cr = *(volatile uint32_t *)(smmu + 0xc00 + 4 * i);
++			if ((s2cr >> 16) & 3) {
++				break;
++			}
++			const vm_offset_t cb = smmu + cb0 + ((s2cr & 0xff) << pgshift);
++			const uint64_t ttbr = *(volatile uint32_t *)(cb + 0x20) | (uint64_t)*(volatile uint32_t *)(cb + 0x24) << 32;
++			/* zc-1: walking these tables froze the phone (hypervisor-owned memory): registers only */
++			IOLog("ISHTAR DPU: sid 0x1c00 smr %u 0x%08x s2cr 0x%08x cbar 0x%08x sctlr 0x%08x ttbr0 0x%llx tcr 0x%08x mair0 0x%08x\n",
++			    i, smr, s2cr, *(volatile uint32_t *)(smmu + (1u << pgshift) + 4 * (s2cr & 0xff)), *(volatile uint32_t *)cb,
++			    ttbr, *(volatile uint32_t *)(cb + 0x30), *(volatile uint32_t *)(cb + 0x38));
++			break;
++		}
++	}
++	static const uint32_t pipeRegs[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x24, 0x30, 0x38};
++	static const uint32_t scalerRegs[] = {0x00, 0x04, 0x0c, 0x10, 0x14, 0x20, 0x40, 0x48, 0x4c};
++	for (uint32_t p = 0; p < 2; p++) {
++		const uint32_t base = kPipes[p].base;
++		for (uint32_t r : pipeRegs) {
++			IOLog("ISHTAR DPU: %s +%03x = %08x\n", kPipes[p].name, r, rd(base + r));
++		}
++		for (uint32_t r : scalerRegs) {
++			IOLog("ISHTAR DPU: %s scaler +%02x = %08x\n", kPipes[p].name, r, rd(base + 0xa00 + r));
++		}
++	}
++	for (uint32_t lm = 0; lm < 2; lm++) {
++		const uint32_t m = 0x44000 + lm * 0x1000;
++		IOLog("ISHTAR DPU: lm%u out_size = %08x op = %08x bg_src_sel = %08x\n", lm, rd(m + 0x04), rd(m + 0x00), rd(m + 0x14));
++		/* blend stages (sdm845_lm_sblk blendstage_base 0x20 + 0x18 n): v12 layout OP, FG_SRC_SEL, CONST_ALPHA */
++		for (uint32_t st = 0; st < 6; st++) {
++			const uint32_t b = m + 0x20 + 0x18 * st;
++			IOLog("ISHTAR DPU: lm%u stage%u op %08x fg_sel %08x alpha %08x\n", lm, st, rd(b + 0x00), rd(b + 0x04), rd(b + 0x08));
++		}
++	}
++	/* CTL0 stage words (dpu_hw_ctl.c CTL_LAYER / _EXT / _EXT2 / _EXT3 per mixer) */
++	for (uint32_t lm = 0; lm < 2; lm++) {
++		const uint32_t c = kCtlBase + d.ctl * kCtlStride;
++		IOLog("ISHTAR DPU: ctl%u lm%u layer %08x ext %08x ext2 %08x ext3 %08x\n", d.ctl, lm, rd(c + 4 * lm), rd(c + 0x40 + 4 * lm),
++		    rd(c + 0x70 + 4 * lm), rd(c + 0xa0 + 4 * lm));
++	}
++	IOLog("ISHTAR DPU: probe done\n");
++}
++
++extern "C" void
++ishtar_dpu_probe_start(void)
++{
++	int on = 0;
++	thread_t t;
++	if (d.ready && PE_parse_boot_argn("ishtardpuprobe", &on, sizeof(on)) && on &&
++	    kernel_thread_start(ishtar_dpu_probe_thread, nullptr, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++/*
++ * Zero-copy (boot-arg ishtardpuzc=1): backboardd's canvas surface (828x1792 BGRA, from the low pool, physically
++ * contiguous and below 4 GiB: the display stream 0x1c00 has stage-1 translation off, zc-2 probe) is scanned in place,
++ * each VIG pipe fetching its half and its QSEED3 v3.2 scaler (dpu_hw_util.c dpu_hw_setup_scaler3, bilinear) stretching
++ * it to 720x3200. No CPU copy. Frames that are not one full-canvas pool surface fall back to the panel mode: the boot
++ * geometry, scaler off, drawn by the CPU into the boot buffer.
++ * The pool is the carve-out after the boot buffer, so the flip back buffer is not kept in this mode.
++ */
++bool ishtar_lowpool_setup_range(uint64_t base, uint64_t size, uint32_t minW, uint32_t minH);   /* IshtarSurface.cpp (C++) */
++/* Knobs (live over the push link: push.py --set dpu.zc 0): zero-copy on/off, a wait before each scan (us). */
++extern "C" void ishtar_knob_register(const char *name, volatile uint32_t *value);   /* bsd/dev/ishtar_push.c */
++static volatile uint32_t gZcEnable = 1, gZcDelayUs;
++extern "C" { volatile uint32_t ishtar_dpu_layerlog, ishtar_dpu_swaplog; }   /* swaplog=N: log the next N zero-copy swaps */   /* knob dpu.layerlog=N: log the next N swaps with several layers */
++
++namespace {
++constexpr uint32_t kSrcSize = 0x00, kSrcXY = 0x08, kOutSize = 0x0c, kOutXY = 0x10;
++constexpr uint32_t kPe[] = {0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x120, 0x124, 0x128};
++constexpr uint32_t kScl = 0xa00, kSclOp = 0x04, kSclStepYH = 0x10, kSclStepYV = 0x14, kSclStepUVH = 0x18,
++                   kSclStepUVV = 0x1c, kSclPreload = 0x20, kSclSrcY = 0x40, kSclSrcUV = 0x44, kSclDst = 0x48,
++                   kSclInitYH = 0x90, kSclInitYV = 0x94, kSclInitUVH = 0x98, kSclInitUVV = 0x9c;
++struct {
++	bool on, surfaceMode;
++	uint32_t canvasW, canvasH, bootStride;
++	uint32_t boot[kMaxLive][4 + 9 + 1];     /* src_size, src_xy, out_size, out_xy, PE x9, scaler op */
++	uint32_t zcFrames, panelFrames;
++} z;
++}
++
++extern "C" bool
++ishtar_dpu_zc_setup(uint32_t canvasW, uint32_t canvasH)
++{
++	if (!d.ready || d.live != 2 || canvasW & 1) {
++		return false;
++	}
++	const uint64_t frame = (uint64_t)rd(kPipes[d.pipe[0]].base + kSsppStride0) * (rd(kPipes[d.pipe[0]].base + kSrcSize) >> 16);
++	const uint64_t poolBase = d.pa[0] + ((frame + 0xfffff) & ~0xfffffull);
++	if (!ishtar_lowpool_setup_range(poolBase, d.pa[0] + kCarveoutBytes - poolBase, canvasW, canvasH)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < d.live; i++) {
++		const uint32_t b = kPipes[d.pipe[i]].base;
++		const uint32_t regs[4] = {kSrcSize, kSrcXY, kOutSize, kOutXY};
++		for (uint32_t r = 0; r < 4; r++) {
++			z.boot[i][r] = rd(b + regs[r]);
++		}
++		for (uint32_t r = 0; r < 9; r++) {
++			z.boot[i][4 + r] = rd(b + kPe[r]);
++		}
++		z.boot[i][13] = rd(b + kScl + kSclOp);
++	}
++	z.canvasW = canvasW;
++	z.canvasH = canvasH;
++	z.bootStride = rd(kPipes[d.pipe[0]].base + kSsppStride0);
++	z.on = true;
++	PE_parse_boot_argn("ishtardpuzcdelay", (void *)&gZcDelayUs, sizeof(gZcDelayUs));
++	ishtar_knob_register("dpu.zc", &gZcEnable);
++	ishtar_knob_register("dpu.zcdelay", &gZcDelayUs);
++	ishtar_knob_register("dpu.layerlog", &ishtar_dpu_layerlog);
++	ishtar_knob_register("dpu.swaplog", &ishtar_dpu_swaplog);
++	IOLog("ISHTAR DPU: zero-copy armed: canvas %ux%u, pool 0x%llx..0x%llx\n", canvasW, canvasH, poolBase, d.pa[0] + kCarveoutBytes);
++	ishtar_dsi_probe(d.pa[0] + frame, poolBase);
++	return true;
++}
++
++/* Pipe geometry: surface mode (canvas half -> 720x3200 through the scaler) or the boot geometry. Before the flush. */
++static void
++ishtar_dpu_mode(bool surface)
++{
++	if (surface == z.surfaceMode) {
++		return;
++	}
++	for (uint32_t i = 0; i < d.live; i++) {
++		const uint32_t b = kPipes[d.pipe[i]].base, outSize = z.boot[i][2];
++		if (!surface) {
++			const uint32_t regs[4] = {kSrcSize, kSrcXY, kOutSize, kOutXY};
++			for (uint32_t r = 0; r < 4; r++) {
++				wr(b + regs[r], z.boot[i][r]);
++			}
++			for (uint32_t r = 0; r < 9; r++) {
++				wr(b + kPe[r], z.boot[i][4 + r]);
++			}
++			wr(b + kScl + kSclOp, z.boot[i][13]);
++			continue;
++		}
++		const uint32_t half = z.canvasW / 2, srcW = half, srcH = z.canvasH;
++		const uint32_t dstW = outSize & 0xffff, dstH = outSize >> 16;
++		const uint32_t src = (srcH << 16) | srcW;
++		wr(b + kSrcSize, src);
++		wr(b + kSrcXY, i ? half : 0);
++		wr(b + kOutSize, outSize);
++		wr(b + kOutXY, z.boot[i][3]);
++		for (uint32_t r = 0; r < 9; r++) {     /* no extension: the hardware scaler fetches its own edges */
++			wr(b + kPe[r], (r % 3) == 2 ? src : 0);
++		}
++		const uint32_t stepX = (uint32_t)(((uint64_t)srcW << 21) / dstW) & 0xffffff;
++		const uint32_t stepY = (uint32_t)(((uint64_t)srcH << 21) / dstH) & 0xffffff;
++		wr(b + kScl + kSclInitYH, 0);
++		wr(b + kScl + kSclInitYV, 0);
++		wr(b + kScl + kSclInitUVH, 0);
++		wr(b + kScl + kSclInitUVV, 0);
++		wr(b + kScl + kSclStepYH, stepX);
++		wr(b + kScl + kSclStepYV, stepY);
++		wr(b + kScl + kSclStepUVH, stepX);     /* the alpha channel uses the second set */
++		wr(b + kScl + kSclStepUVV, stepY);
++		wr(b + kScl + kSclPreload, 4u | (3u << 8) | (4u << 16) | (3u << 24));
++		wr(b + kScl + kSclSrcY, src);
++		wr(b + kScl + kSclSrcUV, src);
++		wr(b + kScl + kSclDst, outSize);
++		const bool alpha = (rd(b + 0x30) >> 8) & 1;     /* ALPHA_ENABLE of the pipe's (boot) format */
++		wr(b + kScl + kSclOp, 1u | (3u << 16) | (1u << 14) | (1u << 31) | (alpha ? (1u << 10) | (1u << 29) : 0));
++		(void)dstH;
++	}
++	z.surfaceMode = surface;
++}
++
++/* Scan a pool surface in place (pa = first pixel, stride in bytes), latched at the next frame start. */
++extern "C" void
++ishtar_dpu_scan_surface(uint64_t pa, uint32_t stride)
++{
++	if (!z.on) {
++		return;
++	}
++	if (gZcDelayUs) {
++		IODelay(gZcDelayUs);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ishtar_dpu_mode(true);
++	for (uint32_t i = 0; i < d.live; i++) {
++		wr(kPipes[d.pipe[i]].base + kSsppSrc0, (uint32_t)pa);
++		wr(kPipes[d.pipe[i]].base + kSsppStride0, stride);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(kCtlBase + d.ctl * kCtlStride + kCtlFlush, d.flush);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	d.front = 2;    /* neither flip buffer */
++	z.zcFrames++;
++}
++
++/* Back to the boot buffer and geometry (a frame the CPU drew there, or a panic). */
++extern "C" void
++ishtar_dpu_scan_panel(void)
++{
++	if (!z.on) {
++		return;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ishtar_dpu_mode(false);
++	for (uint32_t i = 0; i < d.live; i++) {
++		wr(kPipes[d.pipe[i]].base + kSsppSrc0, d.bootSrc[i]);
++		wr(kPipes[d.pipe[i]].base + kSsppStride0, z.bootStride);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(kCtlBase + d.ctl * kCtlStride + kCtlFlush, d.flush);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	d.front = 0;
++	z.panelFrames++;
++}
++
++extern "C" bool
++ishtar_dpu_zc_on(void)
++{
++	return z.on;
++}
++
++/* Zero-copy is armed and switched on (knob dpu.zc). */
++extern "C" bool
++ishtar_dpu_zc_live(void)
++{
++	return z.on && gZcEnable;
++}
++
++/*
++ * Display IOMMU (knob dpu.smmu, default 1): stock HyperOS scans any surface through its own SMMU context (iommu-dma pool
++ * 0x20000..0xfffe0000, stream 0x1c00); the bootloader left stream 0x1c00 on a context bank with translation off (zc-2),
++ * so only physically contiguous memory below 4 GiB could be scanned (the pool, four surfaces). Here a context bank of our
++ * own: the UEFI display carve-out identity-mapped (2 MiB blocks: the boot buffer and the pool keep their addresses), and
++ * 16 surface slots of 8 MiB at IOVA 0x10000000+ mapped 4K page by page from the surface's pages. The stream's S2CR is
++ * repointed to the bank in one write (read back: under the hypervisor it may be refused), dpu.smmu=0 points it back.
++ * Same recipe as bsd/dev/ishtar_smmu.c (touch DMA): tables in DRAM cleaned to the PoC, non-cacheable walks, TLBIALL.
++ * ponytail: fixed slots, least recently scanned evicted; a slot keeps its surface's memory referenced while mapped.
++ */
++#include <IOKit/IOBufferMemoryDescriptor.h>
++
++/* Clean and invalidate to the PoC (the SMMU walks these tables non-cacheably), as bsd/dev/ishtar_board.h does. */
++static void
++ishtar_dpu_clean(const volatile void *va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	const uintptr_t line = (uintptr_t)4 << ((ctr >> 16) & 0xf);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uintptr_t p = (uintptr_t)va & ~(line - 1); p < (uintptr_t)va + len; p += line) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++namespace {
++constexpr uint64_t kSmmuPa = 0x15000000, kSmmuBytes = 0x100000;
++constexpr uint32_t kSlots = 16, kSlotBytes = 8u << 20, kWindow = 0x10000000;
++struct Slot {IOMemoryDescriptor *md; uint64_t used;};
++struct {
++	vm_offset_t smmu;
++	uint32_t gr1, cbo, cb, smr, s2crBoot;
++	IOBufferMemoryDescriptor *tables;       /* L1 | L2 window | L2 carve-out | L3 x (kSlots * 4), 4K each */
++	volatile uint64_t *l1, *l2w, *l2c, *l3;
++	uint64_t pa;
++	Slot slot[kSlots];
++	uint64_t tick;
++	bool built, active;
++	uint32_t maps, evictions, refused;
++} m;
++volatile uint32_t gSmmuWant = 1;    /* on by default (zc-9: no copy fallback, no bounce); boot-arg ishtardpusmmu=0 */
++
++uint32_t srd(uint32_t off) {uint32_t v = *(volatile uint32_t *)(m.smmu + off); __asm__ volatile("dmb oshld" ::: "memory"); return v;}
++void swr(uint32_t off, uint32_t v) {__asm__ volatile("dmb oshst" ::: "memory"); *(volatile uint32_t *)(m.smmu + off) = v; __asm__ volatile("dsb osh" ::: "memory");}
++void swr64(uint32_t off, uint64_t v) {__asm__ volatile("dmb oshst" ::: "memory"); *(volatile uint64_t *)(m.smmu + off) = v; __asm__ volatile("dsb osh" ::: "memory");}
++
++void
++smmu_tlb_all(void)
++{
++	swr(m.cbo + 0x618, 0);          /* TLBIALL */
++	swr(m.cbo + 0x7f0, 0);          /* TLBSYNC */
++	for (int t = 0; t < 100000 && (srd(m.cbo + 0x7f4) & 1); t++) {
++		IODelay(1);
++	}
++}
++}
++
++/* Build the bank and its tables (translation not yet used by the stream). */
++static bool
++ishtar_dpu_smmu_build(void)
++{
++	m.smmu = ml_io_map(kSmmuPa, kSmmuBytes);
++	if (!m.smmu) {
++		return false;
++	}
++	const uint32_t id0 = srd(0x20), id1 = srd(0x24);
++	const unsigned pgshift = (id1 >> 31) ? 16 : 12, ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff, nsmr = id0 & 0xff;
++	const uint32_t cb0 = (1u << (((id1 >> 28) & 7) + 1)) << pgshift;
++	m.gr1 = 1u << pgshift;
++	m.smr = ~0u;
++	uint32_t used[8] = {};
++	for (unsigned i = 0; i < nsmr && i < 128; i++) {
++		const uint32_t smr = srd(0x800 + 4 * i), s2cr = srd(0xc00 + 4 * i);
++		if ((smr & (1u << 31)) && ((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
++		}
++		const uint32_t mask = (smr >> 16) & 0x7fff;
++		if ((smr & (1u << 31)) && !((smr ^ 0x1c00) & ~mask & 0x7fff) && m.smr == ~0u) {
++			m.smr = i;
++			m.s2crBoot = s2cr;
++		}
++	}
++	m.cb = ~0u;
++	for (unsigned c = ns2cb; c < ncb && m.cb == ~0u; c++) {
++		if (!(used[c / 32] & (1u << (c % 32))) && !(srd(cb0 + (c << pgshift)) & 1)) {
++			m.cb = c;
++		}
++	}
++	if (m.smr == ~0u || m.cb == ~0u) {
++		IOLog("ISHTAR DPU: smmu: stream 0x1c00 smr %d, free bank %d\n", (int)m.smr, (int)m.cb);
++		return false;
++	}
++	const uint32_t nTables = 3 + kSlots * 4;
++	m.tables = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, nTables * 0x1000, 0xfffffffff000ull);
++	if (!m.tables || m.tables->prepare() != kIOReturnSuccess) {
++		IOLog("ISHTAR DPU: smmu: no table memory\n");
++		return false;
++	}
++	volatile uint64_t *t = (volatile uint64_t *)m.tables->getBytesNoCopy();
++	bzero((void *)t, nTables * 0x1000);
++	m.pa = m.tables->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++	m.l1 = t;
++	m.l2w = t + 512;
++	m.l2c = t + 1024;
++	m.l3 = t + 1536;
++	const uint64_t blk = 1u << 10 | 2u << 8 | 1u << 6 | 1, page = 1u << 10 | 2u << 8 | 1u << 6 | 3;
++	(void)page;
++	/* L1: 1 GiB entries of the 32-bit IOVA space; [0] the surface window, [2] 0x80000000.. (carve-out) */
++	m.l1[0] = (m.pa + 0x1000) | 3;
++	m.l1[2] = (m.pa + 0x2000) | 3;
++	for (uint64_t a = d.pa[0] & ~0x1fffffull; a < d.pa[0] + kCarveoutBytes; a += 0x200000) {
++		m.l2c[(a - 0x80000000ull) >> 21] = a | blk;                 /* identity, 2 MiB blocks */
++	}
++	for (uint32_t s = 0; s < kSlots; s++) {                        /* slot s: 4 L3 tables, L2 window entries */
++		for (uint32_t k = 0; k < 4; k++) {
++			m.l2w[((kWindow + s * kSlotBytes) >> 21) + k] = (m.pa + 0x3000 + (s * 4 + k) * 0x1000) | 3;
++		}
++	}
++	ishtar_dpu_clean(t, nTables * 0x1000);
++	m.cbo = cb0 + (m.cb << pgshift);
++	swr(m.cbo + 0x0, 0);
++	swr(m.cbo + 0x58, 0xffffffffu);
++	swr(m.gr1 + 0x800 + 4 * m.cb, 1);                               /* CBA2R VA64 */
++	swr(m.gr1 + 4 * m.cb, 1u << 16 | 0xfu << 12 | 3u << 8);          /* CBAR: S1, S2 bypass */
++	swr(m.cbo + 0x10, 7u << 15 | 2);                                /* TCR2: SEP upstream, PA 40-bit */
++	swr(m.cbo + 0x30, 32 | 1u << 23);                               /* TCR: T0SZ 32 (32-bit IOVA), 4K, NC walks, EPD1 */
++	swr(m.cbo + 0x34, m.cb);                                        /* CONTEXTIDR */
++	swr64(m.cbo + 0x20, m.pa | (uint64_t)m.cb << 48);               /* TTBR0 */
++	swr64(m.cbo + 0x28, 0);
++	swr(m.cbo + 0x38, 0x44);                                        /* MAIR0: Normal NC */
++	smmu_tlb_all();
++	swr(m.cbo + 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1);    /* CFIE CFRE AFE TRE M */
++	if (!(srd(m.cbo) & 1)) {
++		IOLog("ISHTAR DPU: smmu: bank %u did not enable\n", m.cb);
++		return false;
++	}
++	m.built = true;
++	IOLog("ISHTAR DPU: smmu: bank %u built (tables 0x%llx), stream 0x1c00 on smr %u s2cr 0x%x\n", m.cb, m.pa, m.smr, m.s2crBoot);
++	return true;
++}
++
++/* Point stream 0x1c00 at our bank (on) or back at the bootloader's (off). Called from present() when the knob changed. */
++extern "C" void
++ishtar_dpu_smmu_apply(void)
++{
++	const bool want = gSmmuWant != 0;
++	if (want == m.active || (want && !m.built && !ishtar_dpu_smmu_build())) {
++		return;
++	}
++	const uint32_t v = want ? m.cb : m.s2crBoot;
++	swr(0xc00 + 4 * m.smr, v);
++	const uint32_t back = srd(0xc00 + 4 * m.smr);
++	if (back != v) {
++		m.refused++;
++		IOLog("ISHTAR DPU: smmu: s2cr %u write 0x%x read back 0x%x: refused\n", m.smr, v, back);
++		gSmmuWant = m.active;
++		return;
++	}
++	m.active = want;
++	IOLog("ISHTAR DPU: smmu: stream 0x1c00 -> %s (s2cr 0x%x)\n", want ? "our bank" : "boot bank", back);
++}
++
++extern "C" bool
++ishtar_dpu_smmu_on(void)
++{
++	return m.active;
++}
++
++/* IOVA of md's bytes [0, len) (len <= 8 MiB), mapping it into a slot when it is not mapped yet; 0 = cannot. */
++extern "C" uint64_t
++ishtar_dpu_smmu_map(IOMemoryDescriptor *md, uint32_t len)
++{
++	if (!m.active || !md || len > kSlotBytes) {
++		return 0;
++	}
++	m.tick++;
++	uint32_t victim = 0;
++	for (uint32_t s = 0; s < kSlots; s++) {
++		if (m.slot[s].md == md) {
++			m.slot[s].used = m.tick;
++			if (ishtar_dpu_swaplog) {
++				/* do the slot's pages still match the surface's? (stale frames: zc-9 showed an old frame every other swap) */
++				const volatile uint64_t *l3 = m.l3 + s * 4 * 512;
++				uint32_t stale = 0, pages = 0;
++				for (uint32_t off = 0; off < len; off += 0x1000, pages++) {
++					IOByteCount seg = 0;
++					const addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++					stale += (l3[off >> 12] & 0xfffffffff000ull) != (pa & ~0xfffull);
++				}
++				IOLog("ISHTAR DPU: swaplog slot %u md %p pages %u stale %u\n", s, md, pages, stale);
++			}
++			return kWindow + (uint64_t)s * kSlotBytes;
++		}
++		if (m.slot[s].used < m.slot[victim].used) {
++			victim = s;
++		}
++	}
++	volatile uint64_t *l3 = m.l3 + victim * 4 * 512;
++	if (m.slot[victim].md) {
++		m.slot[victim].md->release();
++		m.evictions++;
++	}
++	bzero((void *)l3, 4 * 0x1000);
++	for (uint32_t off = 0; off < len; off += 0x1000) {
++		IOByteCount seg = 0;
++		const addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (!pa) {
++			break;
++		}
++		l3[off >> 12] = (pa & ~0xfffull) | 1u << 10 | 2u << 8 | 1u << 6 | 3;
++	}
++	ishtar_dpu_clean(l3, 4 * 0x1000);
++	smmu_tlb_all();
++	md->retain();
++	m.slot[victim] = {md, m.tick};
++	m.maps++;
++	return kWindow + (uint64_t)victim * kSlotBytes;
++}
++
++extern "C" void
++ishtar_dpu_smmu_setup(void)
++{
++	ishtar_knob_register("dpu.smmu", &gSmmuWant);
++	PE_parse_boot_argn("ishtardpusmmu", (void *)&gSmmuWant, sizeof(gSmmuWant));
++}
++
++extern "C" void
++ishtar_dpu_smmu_log(void)
++{
++	if (m.built) {
++		IOLog("ISHTAR DPU: smmu %s bank %u maps %u evictions %u refused %u fsr 0x%x far 0x%llx\n", m.active ? "on" : "off", m.cb,
++		    m.maps, m.evictions, m.refused, srd(m.cbo + 0x58), (uint64_t)srd(m.cbo + 0x60) | (uint64_t)srd(m.cbo + 0x64) << 32);
++	}
++}
+diff --git a/iokit/Kernel/arm/IshtarFramebuffer.cpp b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+index 1a25e6c..89a80fb 100644
+--- a/iokit/Kernel/arm/IshtarFramebuffer.cpp
++++ b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+@@ -225,6 +225,36 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+  */
+ extern "C" IOReturn native_adreno_new_user_client(IOService *, task_t, void *, UInt32, OSDictionary *, IOUserClient **, unsigned);
+ extern "C" int native_adreno_wait_idle(uint32_t timeout_us);
++/* IshtarDpu.cpp: SM8550 display controller (boot-arg ishtardpu=1): page flipping on the bootloader's path */
++extern "C" bool ishtar_dpu_init(uint64_t fbPa, uintptr_t fbVa, uint32_t height, uint32_t stride);
++extern "C" uintptr_t ishtar_dpu_buffer(uint32_t idx);
++extern "C" uint32_t ishtar_dpu_front(void);
++extern "C" void ishtar_dpu_wait_latch(void);
++extern "C" bool ishtar_dpu_latched(void);
++extern "C" bool ishtar_dpu_te_calibrate(void);
++extern "C" void ishtar_dsi_poll(void);
++extern "C" uint64_t ishtar_dpu_next_frame_ns(void);
++extern "C" uint64_t ishtar_dpu_frame_ns(void);
++extern "C" void ishtar_knob_register(const char *name, volatile uint32_t *value);    /* bsd/dev/ishtar_push.c */
++/* knobs: fb.trace=N logs the last N frames' timing at the next stats line; fb.swapwait=0 answers SwapWait at once (the in-use
++ * hold still keeps CoreAnimation off the scanned surface) */
++/* fb.swapwait: 1 = swap N completes when N latched; 2 = when N-1 latched; 0 = at once (black bands: CoreAnimation reuses its
++ * buffers on SwapWait alone, it does not look at IOSurfaceIsInUse for them). te-5: 2 still showed bands; 1 is the default. */
++static volatile uint32_t ishtar_fb_tracelog, ishtar_fb_swapwait = 1;
++extern "C" void ishtar_dpu_flip(uint32_t idx);
++extern "C" void ishtar_dpu_restore(void);
++extern "C" void ishtar_dpu_log(void);
++extern "C" void ishtar_dpu_probe_start(void);
++extern "C" bool ishtar_dpu_zc_setup(uint32_t canvasW, uint32_t canvasH);
++extern "C" void ishtar_dpu_scan_surface(uint64_t pa, uint32_t stride);
++extern "C" void ishtar_dpu_scan_panel(void);
++extern "C" bool ishtar_dpu_zc_live(void);
++extern "C" volatile uint32_t ishtar_dpu_layerlog, ishtar_dpu_swaplog;
++extern "C" void ishtar_dpu_smmu_setup(void);
++extern "C" void ishtar_dpu_smmu_apply(void);
++extern "C" bool ishtar_dpu_smmu_on(void);
++extern "C" uint64_t ishtar_dpu_smmu_map(IOMemoryDescriptor *md, uint32_t len);
++extern "C" void ishtar_dpu_smmu_log(void);
+ static void ishtar_dpu_probe_thread(void *arg, wait_result_t wr);   /* ishtarfb_dpuprobe=1, below */   /* a740/NativeAdrenoPublish.cpp: -1 no GPU, 0 idle, 1 timeout */
+ 
+ IOReturn
+@@ -299,6 +329,14 @@ public:
+ 	int           fPipe;            /* index into ishtar_mdp_pipes, -1 = unknown */
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          fFlip;
++	bool          fDpu;             /* SM8550 page flipping (IshtarDpu.cpp), instead of the SDM845 fFlip path */
++	bool          fDpuZc;           /* SM8550 zero-copy (ishtardpuzc=1): pool surfaces scanned in place, scaled by the pipes */
++	bool          dpuZcPresent(const uint8_t *rec, uint32_t mask);
++	IshtarSurface *fDpuHeld;        /* the surface on the panel, retained and marked in use (IOSurfaceIsInUse) */
++	void          dpuHold(IshtarSurface *s);
++	void          dpuZcRetire(bool wait);
++	IshtarSurface *fDpuPend;        /* flushed, not yet latched (vsync-paced zero-copy) */
++	uint32_t      fDpuPendID;
+ 	uint32_t      fFront;
+ 	uint64_t      fBufPA[3];
+ 	uintptr_t     fBufVA[3];
+@@ -412,6 +450,7 @@ public:
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t gpuWaitTimeouts;                               /* 2022: swaps copied although the GPU had not finished in 30 ms */
++		uint64_t gpuWaits, gpuWaitAbs, gpuWaitMaxAbs;           /* present()'s GPU wait: count, total, max */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+ 		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
+ 		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
+@@ -697,6 +736,24 @@ AppleCLCD::start(IOService *provider)
+ 			thread_deallocate(t);
+ 		}
+ 	}
++	{
++		int dpu = 0;
++		if (!ishtar_board_ref() && PE_parse_boot_argn("ishtardpu", &dpu, sizeof(dpu)) && dpu) {
++			fDpu = ishtar_dpu_init(fPhys, fPixels, fHeight, fRowBytes);
++			if (fDpu) {
++				ishtar_fb_panic_hook = ishtar_dpu_restore;      /* a panic shows the boot buffer, where the panic text goes */
++				ishtar_dpu_probe_start();       /* ishtardpuprobe=1: zero-copy ground truth, read-only */
++				int zc = 0;
++				PE_parse_boot_argn("ishtardpuzc", &zc, sizeof(zc));
++				fDpuZc = zc && ishtar_dpu_zc_setup(fLogicalW, fLogicalH);
++				ishtar_knob_register("fb.trace", &ishtar_fb_tracelog);
++				ishtar_knob_register("fb.swapwait", &ishtar_fb_swapwait);
++				if (fDpuZc) {
++					ishtar_dpu_smmu_setup();        /* knob dpu.smmu / boot-arg ishtardpusmmu: scan any surface */
++				}
++			}
++		}
++	}
+ 	if (ishtar_board_ref()) {
+ 		mdpProbe();
+ 		int flip = 0;
+@@ -871,7 +928,7 @@ AppleCLCD::start(IOService *provider)
+ 		fFlushTicks = 1;
+ 	}
+ 	fVsync->setTimeoutUS(fVsyncUS);
+-	if (fEarly) {
++	if (fEarly || fDpuZc) {        /* SM8550 flips at swap time too (te-2/3 froze: the swap kicked a timer never made) */
+ 		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
+ 		if (fSwapTimer == NULL || fWorkLoop->addEventSource(fSwapTimer) != kIOReturnSuccess) {
+ 			OSSafeReleaseNULL(fSwapTimer);
+@@ -881,6 +938,68 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
++	/*
++	 * ProMotion: CoreAnimation builds its display modes from the framebuffer's TimingElements (QuartzCore 22H352 reads ID,
++	 * Score, IsVirtual, HorizontalAttributes/VerticalAttributes Active, SyncRate, PreciseSyncRate; rates 16.16 fixed point).
++	 * With none it ran at 60 even with the panel at 120 Hz (hz-1). One element at the panel's rate (ishtardsihz, default 120).
++	 */
++	if (fDpuZc) {
++		uint32_t hz = 120;
++		PE_parse_boot_argn("ishtardsihz", &hz, sizeof(hz));
++		hz = hz == 120 ? 120 : 60;
++		OSDictionary *h = OSDictionary::withCapacity(1), *v = OSDictionary::withCapacity(3), *e = OSDictionary::withCapacity(5);
++		OSArray *list = OSArray::withCapacity(1);
++		if (h && v && e && list) {
++			OSNumber *n;
++#define ISHTAR_SETNUM(dict, key, val) do { n = OSNumber::withNumber((unsigned long long)(val), 32); (dict)->setObject(key, n); n->release(); } while (0)
++			ISHTAR_SETNUM(h, "Active", fLogicalW);
++			ISHTAR_SETNUM(v, "Active", fLogicalH);
++			ISHTAR_SETNUM(v, "SyncRate", hz << 16);
++			ISHTAR_SETNUM(v, "PreciseSyncRate", hz << 16);
++			ISHTAR_SETNUM(e, "ID", 0);
++			ISHTAR_SETNUM(e, "Score", 100);
++#undef ISHTAR_SETNUM
++			e->setObject("IsVirtual", kOSBooleanFalse);
++			e->setObject("HorizontalAttributes", h);
++			e->setObject("VerticalAttributes", v);
++			list->setObject(e);
++			setProperty("TimingElements", list);
++			/*
++			 * IOMFBDisplayRefresh, the refresh range CoreAnimation reads in AppleDisplay::update_display_limits. Units from a
++			 * real ProMotion display (MacBookPro18,1 ioreg): intervals in seconds x 2^32 (displayMin/MaxRefreshInterval), the
++			 * same in mach time (...MachTime), the step in ns and mach time. gov-3 gave the minimum as mach time (160000 =
++			 * 1/26843 s) and backboardd threw. Ours: 120 Hz down to 60 Hz in steps of one panel frame (no variable refresh).
++			 */
++			{
++				OSDictionary *r = OSDictionary::withCapacity(6);
++				uint64_t minMach, maxMach;
++				nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &minMach);
++				nanoseconds_to_absolutetime(NSEC_PER_SEC / 60, &maxMach);
++				const struct { const char *key; uint64_t value; } kv[] = {
++					{"displayMinRefreshInterval", (1ull << 32) / hz},
++					{"displayMaxRefreshInterval", (1ull << 32) / 60},
++					{"displayMinRefreshIntervalMachTime", minMach},
++					{"displayMaxRefreshIntervalMachTime", maxMach},
++					{"displayRefreshStep", NSEC_PER_SEC / hz},
++					{"displayRefreshStepMachTime", minMach},
++				};
++				for (unsigned k = 0; r && k < sizeof(kv) / sizeof(kv[0]); k++) {
++					OSNumber *num = OSNumber::withNumber(kv[k].value, 64);
++					r->setObject(kv[k].key, num);
++					num->release();
++				}
++				if (r) {
++					setProperty("IOMFBDisplayRefresh", r);
++					r->release();
++				}
++			}
++			IOLog("ISHTAR FB: TimingElements: %ux%u at %u Hz\n", fLogicalW, fLogicalH, hz);
++		}
++		OSSafeReleaseNULL(h);
++		OSSafeReleaseNULL(v);
++		OSSafeReleaseNULL(e);
++		OSSafeReleaseNULL(list);
++	}
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+@@ -957,6 +1076,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if (fb->fDpuZc) {
++		fb->dpuZcRetire(false);
++	}
+ 	/*
+ 	 * 0216: with ishtarfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
+ 	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
+@@ -964,7 +1086,28 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 */
+ 	uint64_t stamp = now;
+ 	uint32_t nextUS = fb->fVsyncUS;
+-	if (fb->fVsyncAlign) {
++	/* calibrated once, from the tick (thread context); then every tick fires just after the panel's frame start */
++	static bool teTried;
++	if (fb->fDpu && !teTried && count > 600) {
++		teTried = true;
++		(void)ishtar_dpu_te_calibrate();
++	}
++	if (fb->fDpu) {
++		ishtar_dsi_poll();      /* knob dsi.hz */
++	}
++	const uint64_t teNext = fb->fDpu ? ishtar_dpu_next_frame_ns() : 0;
++	if (teNext != 0) {
++		const uint64_t frame = ishtar_dpu_frame_ns();
++		uint64_t at = teNext + 300000;          /* 0.3 ms after the frame begins: the latch of the last flush is done */
++		nextUS = (uint32_t)(at / 1000);
++		uint64_t since;
++		nanoseconds_to_absolutetime(frame > teNext ? frame - teNext : 0, &since);
++		stamp = now > since ? now - since : now;   /* this frame's start */
++		if (stamp <= fb->fLastStamp) {
++			stamp = fb->fLastStamp + 1;
++		}
++		fb->fLastStamp = stamp;
++	} else if (fb->fVsyncAlign) {
+ 		uint64_t ph = __atomic_load_n(&fb->fPhaseAbs, __ATOMIC_ACQUIRE);
+ 		if (fb->fPeriodAbs == 0) {
+ 			nanoseconds_to_absolutetime((uint64_t)fb->fVsyncUS * 1000, &fb->fPeriodAbs);
+@@ -1104,6 +1247,30 @@ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ 	if (fb->fPowerOff) {
+ 		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
+ 	}
++	if (fb->fDpuZc) {
++		/*
++		 * SM8550: flip at swap time (the trace: a swap waited up to a frame for the next tick, then a frame for its latch).
++		 * Nothing below is for this board: zcPoll/latchWatch read the reference board's MDP registers.
++		 */
++		IOLockLock(fb->fLock);
++		if (!fb->fDirty || !fb->gpuGateOpen(mach_absolute_time())) {
++			bool again = fb->fDirty;
++			IOLockUnlock(fb->fLock);
++			if (again) {
++				fb->fSwapTimer->setTimeoutUS(250);      /* the GPU is still drawing what was submitted before this swap */
++			}
++			return;
++		}
++		memcpy(fb->fEarlyRec, fb->fPending, ISHTAR_FB_SWAP_REC_SIZE);
++		fb->fDirty = false;
++		memcpy(taken, fb->fPendHold, sizeof(taken));
++		bzero(fb->fPendHold, sizeof(fb->fPendHold));
++		IOLockUnlock(fb->fLock);
++		fb->dpuZcRetire(false);
++		fb->present(fb->fEarlyRec);
++		ishtar_hold_release(taken);
++		return;
++	}
+ 	fb->zcPoll();           /* 0216: also kicked by SwapWait when it saw the latch, so the frame it waited for is released now */
+ 	fb->scanBlitPoll();     /* 0241: a GPU scan-out copy whose fence passed is scanned now */
+ 	fb->latchWatch();       /* 0217: while a frame is queued this timer comes back every 500 us */
+@@ -1227,7 +1394,43 @@ AppleCLCD::statsTick(uint64_t now)
+ 	ishtar_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || ishtar_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+ 		fStLogT = now;
+-		IOLog("ISHTAR FB: stats %s", line);
++		/* IOLog truncates long lines: the stats in pieces, then present()'s GPU wait over this window */
++		for (size_t o = 0, n = strlen(line); o < n; o += 160) {
++			IOLog("ISHTAR FB: stats+%zu %.160s\n", o, line + o);
++		}
++		const uint64_t dGw = c.gpuWaits - p.gpuWaits;
++		if (ishtar_fb_tracelog) {
++			char *t = (char *)IOMallocData(16384);
++			if (t != NULL) {
++				size_t n = ishtar_fb_trace_text(t, 16384), shown = 0;
++				/* the newest ishtar_fb_tracelog lines: skip from the front */
++				uint32_t lines = 0;
++				for (size_t i = 0; i < n; i++) {
++					lines += t[i] == '\n';
++				}
++				uint32_t skip = lines > ishtar_fb_tracelog + 1 ? lines - ishtar_fb_tracelog - 1 : 0;
++				for (size_t i = 0, line = 0; i < n; line++) {
++					size_t e = i;
++					while (e < n && t[e] != '\n') {
++						e++;
++					}
++					if (line == 0 || line > skip) {
++						IOLog("ISHTAR FB: trace %.*s\n", (int)(e - i), t + i);
++						shown++;
++					}
++					i = e + 1;
++				}
++				IOFreeData(t, 16384);
++			}
++			ishtar_fb_tracelog = 0;
++		}
++		IOLog("ISHTAR FB: gpu wait n=%llu avg_us=%llu max_us=%llu timeouts=%llu\n", dGw,
++		    dGw ? ishtar_abs_us(c.gpuWaitAbs - p.gpuWaitAbs) / dGw : 0, ishtar_abs_us(c.gpuWaitMaxAbs), c.gpuWaitTimeouts);
++		fSt.gpuWaitMaxAbs = 0;
++		if (fDpu) {
++			ishtar_dpu_log();
++			ishtar_dpu_smmu_log();
++		}
+ 	}
+ 	fStPrev = fSt;
+ 	fStPrev.swaps = swaps;
+@@ -1335,7 +1538,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
+ 	ishtar_hold_release(dropped);
+-	if (fEarly && !fPowerOff) {
++	if ((fEarly || fDpuZc) && fSwapTimer != NULL && !fPowerOff) {
+ 		fSwapTimer->setTimeoutUS(1);    /* scan it now: the MDP latches at its next vsync */
+ 	}
+ 	if ((++ishtar_fb_swap_count % 1000) == 0) {
+@@ -1911,6 +2114,10 @@ void
+ AppleCLCD::blackout(void)
+ {
+ 	memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
++	if (fDpu) {
++		ishtar_dpu_wait_latch();
++		ishtar_dpu_flip(0);     /* the cleared boot buffer */
++	}
+ 	if (fFlip && (fFront != 0 || fHwOn)) {
+ 		scanTo(0);
+ 		if (fZc) {
+@@ -2140,6 +2347,35 @@ AppleCLCD::swapWait(uint32_t id)
+ IOReturn
+ AppleCLCD::swapWaitInner(uint32_t id)
+ {
++	/*
++	 * SM8550 zero-copy: swap N is complete once its frame has latched (dpuZcPresent / the panel fallback set fSwapDone);
++	 * until then the surface of N-1 may still be on the panel (zc-4/5: CoreAnimation cleared it there, black bands).
++	 * Busy after 1.5 frames: CoreAnimation asks again.
++	 */
++	if (fDpuZc) {
++		const uint32_t sw = ishtar_fb_swapwait;
++		if (sw == 2) {
++			id--;           /* wait for the swap before it */
++		}
++		if (!sw || fPowerOff || id == 0 || (int32_t)(id - __atomic_load_n(&fSwapNewest, __ATOMIC_ACQUIRE)) > 0) {
++			return kIOReturnSuccess;
++		}
++		uint64_t t0 = mach_absolute_time(), limit;
++		nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1500, &limit);
++		while ((int32_t)(__atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE) - id) < 0) {
++			if ((int32_t)(__atomic_load_n(&fDpuPendID, __ATOMIC_ACQUIRE) - id) >= 0 && ishtar_dpu_latched()) {
++				break;          /* latched; the vsync tick moves the hold */
++			}
++			if (mach_absolute_time() - t0 > limit) {
++				fSt.swapWaitTimeouts++;
++				return kIOReturnBusy;
++			}
++			IODelay(200);
++		}
++		fSt.swapWaits++;
++		fSt.swapWaitAbs += mach_absolute_time() - t0;
++		return kIOReturnSuccess;
++	}
+ 	if (!fSwapSync || !fEarly || fPowerOff || id == 0 || fSwapTimer == NULL) {
+ 		return kIOReturnSuccess;
+ 	}
+@@ -3444,6 +3680,142 @@ AppleCLCD::quietConsole(void)
+ 	}
+ }
+ 
++/*
++ * SM8550 zero-copy: a swap of exactly one layer that is a whole-canvas pool surface is scanned in place (IshtarDpu.cpp
++ * scales it); anything else takes the copy path. Returns once the new surface is latched, so the previous one is off
++ * the panel when backboardd gets it back.
++ */
++bool
++AppleCLCD::dpuZcPresent(const uint8_t *rec, uint32_t mask)
++{
++	int only = -1, count = 0;
++	for (uint32_t layer = 0; layer < ISHTAR_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			only = only < 0 ? (int)layer : only;
++			count++;
++		}
++	}
++	if (count > 1 && ishtar_dpu_layerlog) {
++		/* ground truth for hardware composition: what backboardd hands over when it sends several layers */
++		ishtar_dpu_layerlog--;
++		for (uint32_t layer = 0; layer < ISHTAR_FB_LAYERS; layer++) {
++			const uint32_t id = get32(rec, 0x54 + 4 * layer);
++			if (!(mask & (1u << layer)) || id == 0) {
++				continue;
++			}
++			const uint8_t *sr = rec + 0x64 + 16 * layer, *dr = rec + 0xc4 + 16 * layer;
++			IshtarSurface *ls = ishtar_surface_copy(id);
++			IOLog("ISHTAR DPU: swap %u layer %u surf %u %ux%u fmt 0x%x bpr %u pooled %d | src %u,%u %ux%u -> dst %u,%u %ux%u\n",
++			    get32(rec, 0x50), layer, id, ls ? ls->width : 0, ls ? ls->height : 0, ls ? ls->pixelFormat : 0,
++			    ls ? ls->bytesPerRow : 0, ls ? ls->pooled : -1, get32(sr, 0), get32(sr, 4), get32(sr, 8), get32(sr, 12),
++			    get32(dr, 0), get32(dr, 4), get32(dr, 8), get32(dr, 12));
++			OSSafeReleaseNULL(ls);
++		}
++	}
++	if (count != 1) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * only, *b = rec + 0xc4 + 16 * only;
++	IshtarSurface *s = ishtar_surface_copy(get32(rec, 0x54 + 4 * only));
++	bool ok = s != NULL && s != fSurface && s->width == fLogicalW && s->height == fLogicalH &&
++	    get32(a, 0) == 0 && get32(a, 4) == 0 && get32(b, 0) == 0 && get32(b, 4) == 0 &&
++	    (get32(b, 8) == 0 || get32(b, 8) == fLogicalW) && (get32(b, 12) == 0 || get32(b, 12) == fLogicalH) &&
++	    (s->offset & 63) == 0 && (s->bytesPerRow & 63) == 0 && s->memory != NULL;
++	/* where the pipes fetch it: a pool surface at its physical address (identity-mapped either way), any other surface
++	 * through the display IOMMU when it is on */
++	uint64_t at = 0;
++	if (s != NULL && ishtar_dpu_swaplog) {
++		ishtar_dpu_swaplog--;
++		/* content checksum after an invalidate: do the GPU's frames reach these pages? (every 64th row, 256 bytes in the middle) */
++		uint32_t sum = 0;
++		const uintptr_t va = s->kernelAddress();
++		for (uint32_t y = 0; va && y < s->height; y += 64) {
++			const uintptr_t row = va + s->offset + (uint64_t)y * s->bytesPerRow + s->bytesPerRow / 2;
++			for (uintptr_t l = row & ~63ull; l < row + 256; l += 64) {
++				__asm__ volatile ("dc civac, %0" :: "r"(l) : "memory");
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			for (uint32_t i = 0; i < 64; i++) {
++				sum = sum * 31 + ((volatile const uint32_t *)row)[i];
++			}
++		}
++		IOLog("ISHTAR DPU: swaplog swap %u surf %u pooled %d md %p %ux%u ok %d sum %08x\n", get32(rec, 0x50),
++		    get32(rec, 0x54 + 4 * only), s->pooled, s->memory, s->width, s->height, ok, sum);
++	}
++	if (ok && s->pooled) {
++		at = s->poolPA + s->offset;
++		ok = at + (uint64_t)s->bytesPerRow * fLogicalH <= (1ull << 32);
++	} else if (ok && ishtar_dpu_smmu_on()) {
++		const uint64_t iova = ishtar_dpu_smmu_map(s->memory, s->allocSize);
++		at = iova + s->offset;
++		ok = iova != 0;
++	} else {
++		ok = false;
++	}
++	if (ok) {
++		dpuZcRetire(true);      /* a frame still waiting for its vsync is not overwritten */
++		ishtar_dpu_scan_surface(at, s->bytesPerRow);
++		if (struct ishtar_fb_trace_rec *tr = ishtar_fb_trace_of(fCurSwapID)) {
++			tr->scan = mach_absolute_time();
++		}
++		s->retain();
++		ishtar_hold(s, true);   /* flushed, not latched: CoreAnimation must not draw into it either (black bands, swapwait=0) */
++		fDpuPend = s;
++		/* after the flush write: until the vsync the flush bits read busy, so SwapWait cannot see this frame latched early */
++		__atomic_store_n(&fDpuPendID, fCurSwapID, __ATOMIC_RELEASE);
++		fSt.zc++;      /* zc_frames in the stats line */
++	}
++	OSSafeReleaseNULL(s);
++	return ok;
++}
++
++/*
++ * Vsync pacing: a flushed frame latches at the panel's next vsync. Waiting for that inside present() blocked the work loop
++ * that also sends CoreAnimation its vsyncs, so every other one was lost (about 30 fps). The frame is completed here instead:
++ * from the vsync tick, before the next scan (wait), or by SwapWait seeing the latch itself.
++ */
++void
++AppleCLCD::dpuZcRetire(bool wait)
++{
++	if (fDpuPend == NULL) {
++		return;
++	}
++	if (wait) {
++		ishtar_dpu_wait_latch();
++	} else if (!ishtar_dpu_latched()) {
++		return;
++	}
++	if (struct ishtar_fb_trace_rec *tr = ishtar_fb_trace_of(fDpuPendID)) {
++		tr->latch = tr->done = mach_absolute_time();
++	}
++	dpuHold(fDpuPend);      /* on the panel now; the one before it is not */
++	ishtar_hold(fDpuPend, false);   /* its pending hold: dpuHold holds it now */
++	fDpuPend->release();
++	fDpuPend = NULL;
++	__atomic_store_n(&fSwapDone, fDpuPendID, __ATOMIC_RELEASE);   /* SwapWait: this swap is complete */
++}
++
++/*
++ * zc-3: CoreAnimation cleared the surface still being scanned (black bands) when it began its next frame. The surface on
++ * the panel stays marked in use until a newer frame has latched; then it is handed back. NULL: none is scanned any more.
++ */
++void
++AppleCLCD::dpuHold(IshtarSurface *s)
++{
++	if (s == fDpuHeld) {
++		return;
++	}
++	if (s != NULL) {
++		s->retain();
++		ishtar_hold(s, true);
++	}
++	if (fDpuHeld != NULL) {
++		ishtar_hold(fDpuHeld, false);
++		fDpuHeld->release();
++	}
++	fDpuHeld = s;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -3455,9 +3827,21 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 * GPU-composited frames (ishtarmetal=1): backboardd swaps right after submitting its Metal work, so the surface may
+ 	 * still be drawn; copying it then showed half-drawn (ghosted) and empty frames. Wait for the GPU first (30 ms cap).
+ 	 */
++	const uint64_t tg0 = mach_absolute_time();
+ 	if (native_adreno_wait_idle(30000) > 0) {
+ 		fSt.gpuWaitTimeouts++;
+ 	}
++	const uint64_t tg = mach_absolute_time() - tg0;
++	fSt.gpuWaits++;
++	fSt.gpuWaitAbs += tg;
++	fSt.gpuWaitMaxAbs = tg > fSt.gpuWaitMaxAbs ? tg : fSt.gpuWaitMaxAbs;
++	if (fDpuZc) {
++		ishtar_dpu_smmu_apply();        /* the dpu.smmu knob changed: repoint the display stream */
++	}
++	if (fDpuZc && ishtar_dpu_zc_live() && dpuZcPresent(rec, mask)) {
++		fEmptyBlackArmed = false;
++		return;         /* scanned in place */
++	}
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		fEmptyBlackArmed = false;
+@@ -3478,6 +3862,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		fSt.emptySwaps++;
+ 		if (!fEmptyBlackArmed) {
+ 			fSt.emptyKept++;
++			if (fDpuZc) {
++				__atomic_store_n(&fSwapDone, fCurSwapID, __ATOMIC_RELEASE);   /* nothing to show: complete at once */
++			}
+ 			return;
+ 		}
+ 	}
+@@ -3492,6 +3879,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip) {
+ 		waitLatch();    /* the buffer we draw into may still be on the panel */
+ 	}
++	if (fDpu) {
++		ishtar_dpu_wait_latch();        /* the last flip latched: the other buffer is off the panel */
++		back = fDpuZc ? 0 : ishtar_dpu_front() ^ 1;   /* zero-copy: the pool took the back buffer; the boot one is off-panel */
++		fDrawIdx = back;
++		fDraw = ishtar_dpu_buffer(back);
++	}
+ 	/*
+ 	 * 0227: a swap with no layer (CoreAnimation's first swap after the display comes back on) means nothing is
+ 	 * composed: black. The copy path below would draw nothing and scan the back buffer as it is, which still holds the
+@@ -3621,6 +4014,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
++	if (fDpu) {
++		if (fDpuZc) {
++			dpuZcRetire(true);
++			ishtar_dpu_scan_panel();
++			ishtar_dpu_wait_latch();
++			dpuHold(NULL);  /* the boot buffer is on the panel: no surface is scanned */
++			__atomic_store_n(&fSwapDone, fCurSwapID, __ATOMIC_RELEASE);
++		} else {
++			ishtar_dpu_flip(back);
++		}
++	}
+ 	uint64_t tcpd = mach_absolute_time() - tcp0;
+ 	uint64_t tcpx = (fSt.latchWaitAbs - tlw0) + (fHudDrawAbs - thd0);      /* latch waits and the HUD are not the copy */
+ 	tcpd = tcpd > tcpx ? tcpd - tcpx : 0;
+diff --git a/iokit/Kernel/arm/IshtarSurface.cpp b/iokit/Kernel/arm/IshtarSurface.cpp
+index d910b5f..6bc642c 100644
+--- a/iokit/Kernel/arm/IshtarSurface.cpp
++++ b/iokit/Kernel/arm/IshtarSurface.cpp
+@@ -312,6 +312,40 @@ ishtar_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW, ui
+ 	return true;
+ }
+ 
++/*
++ * SM8550 (IshtarDpu.cpp, ishtardpuzc=1): the pool at a range the display layer chose (the UEFI display carve-out after
++ * the boot framebuffer, below 4 GiB as the pipe address registers need), write-combined so CPU-drawn pixels reach DRAM
++ * without a clean. Only the overlap with xnu's RAM is checked; the SDM845 limits of ishtar_lowpool_setup do not apply.
++ */
++bool
++ishtar_lowpool_setup_range(uint64_t base, uint64_t size, uint32_t minW, uint32_t minH)
++{
++	ishtar_surface_init_lock();
++	if (ishtar_lowpool.ready || (base & (PAGE_SIZE - 1)) || (size & (PAGE_SIZE - 1)) || size < (4ull << 20) ||
++	    base + size > (1ull << 32) || ishtar_overlap(base, size, (uint64_t)gPhysBase, (uint64_t)gPhysSize)) {
++		IOLog("ISHTAR SURF: low pool 0x%llx + 0x%llx refused\n", base, size);
++		return false;
++	}
++	uint32_t pages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t *until = (uint64_t *)IOMallocData(pages * sizeof(uint64_t));
++	if (until == NULL) {
++		return false;
++	}
++	bzero(until, pages * sizeof(uint64_t));
++	clock_interval_to_absolutetime_interval(ISHTAR_LOWPOOL_COOL_MS, 1000 * 1000, &ishtar_lowpool.cool);
++	ishtar_lowpool.cache = kIOMapWriteCombineCache;
++	ishtar_lowpool.cacheable = false;
++	ishtar_lowpool.base = base;
++	ishtar_lowpool.pages = pages;
++	ishtar_lowpool.until = until;
++	ishtar_lowpool.minW = minW;
++	ishtar_lowpool.minH = minH;
++	ishtar_lowpool.ready = true;
++	IOLog("ISHTAR SURF: low pool 0x%llx..0x%llx (%llu MiB, write-combined); BGRA surfaces >= %ux%u go here\n",
++	    base, base + size, size >> 20, minW, minH);
++	return true;
++}
++
+ /* A block of np pages, or 0. Pages 0 and pages-1 are never handed out (guards). */
+ static uint64_t
+ ishtar_lowpool_alloc(uint32_t bytes)
+diff --git a/iokit/Kernel/arm/IshtarSurface.h b/iokit/Kernel/arm/IshtarSurface.h
+index 98118e5..f33da43 100644
+--- a/iokit/Kernel/arm/IshtarSurface.h
++++ b/iokit/Kernel/arm/IshtarSurface.h
+@@ -86,6 +86,7 @@ IshtarSurface *ishtar_surface_create_physical(uint64_t phys, uint32_t width,
+  * splash range is the continuous-splash carve-out (also excluded).
+  */
+ bool ishtar_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW, uint32_t minH);
++bool ishtar_lowpool_setup_range(uint64_t base, uint64_t size, uint32_t minW, uint32_t minH);   /* SM8550, IshtarDpu.cpp */
+ 
+ /* The pool maps cacheable (write-back): the CPU must clean a frame before the MDP reads it. */
+ bool ishtar_lowpool_cacheable(void);
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 4c2a9be..ee82adf 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@ iokit/Kernel/arm/IshtarKeyStore.cpp                               optional iokit
+ iokit/Kernel/arm/IshtarWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/IshtarSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/IshtarFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/IshtarDpu.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/IshtarAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/IshtarNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/IshtarBattery.cpp                                optional iokitcpp

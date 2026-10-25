@@ -1,0 +1,16 @@
+# Build outputs and local inputs (Apple/Qualcomm binaries, device dumps) never go in git.
+out/
+research/
+*.img
+*.adt
+*.ipsw
+*.dmg
+# Fetched by scripts/sync-base.py (upstream has no license: fetched, not redistributed).
+xnu/base/
+tools/base/
+# Local reference copies of other ports.
+ref/
+__pycache__/
+.DS_Store
+# Upstream layout for tools/base scripts (their repo root = tools/, their tools/ = tools/base).
+tools/tools

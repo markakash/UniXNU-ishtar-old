@@ -1,0 +1,230 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 4bd6078..0666ede 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1372,6 +1372,7 @@ geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
+  */
+ static int gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div);
+ static void touch_power_cycle(vm_offset_t tlmm);
++static void fts_run(vm_offset_t tlmm);
+ static void gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+ static int gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx);
+ static bool gpi_loop;   /* SE loopback (CONFIG0 flag bit 0), full duplex of ntx bytes: data-path self test */
+@@ -1449,7 +1450,10 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+ 		 * fts_system_reset (0x81 -> 0x20000024). HW reg write = FA + 4-byte address + value.
+ 		 */
+ 		static const uint8_t spi4[][2] = { { 0x32, 0x10 }, { 0x34, 0x02 }, { 0x3e, 0x07 }, { 0x3d, 0x30 }, { 0x2d, 0x02 } };
+-		for (uint32_t i = 0; i < 5; i++) {
++		/* stock fts_init: only when the system reset fails (no fw); with fw it rewrites the chip's GPIOs (irq) */
++		int spi4set = 0;
++		PE_parse_boot_argn("ishtartouchspi4", &spi4set, sizeof(spi4set));
++		for (uint32_t i = 0; spi4set && i < 5; i++) {
+ 			uint8_t w[6] = { 0xfa, 0x20, 0x00, 0x00, spi4[i][0], spi4[i][1] };
+ 			gpi_spi_xfer2(w, 6, rx, 0);
+ 		}
+@@ -1465,6 +1469,11 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+ 		rc = gpi_spi_xfer2(ev_cmd, 1, rx, 9);
+ 		printf("ISHTAR TOUCHPROBE: fts event rc %d: %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", rc, rx[0], rx[1],
+ 		    rx[2], rx[3], rx[4], rx[5], rx[6], rx[7], rx[8]);
++		int run = 1;
++		PE_parse_boot_argn("ishtartouchrun", &run, sizeof(run));
++		if (run && rc == 0) {
++			fts_run(tlmm);
++		}
+ 		return;
+ 	}
+ 	rc = geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
+@@ -1501,9 +1510,15 @@ static uint32_t gpi_gpii = 1;   /* boot-arg ishtartouchgpii=N; -1 (default) only
+ 
+ static uint32_t tp_pace_ms;     /* ishtartouchdefer: pause after each step so the USB live log gets it out */
+ 
++static bool tp_quiet;    /* event loop: no per-transfer logging or pacing */
++#define TPQ(...) do { if (!tp_quiet) printf(__VA_ARGS__); } while (0)
++
+ static void
+ tp_step(const char *what)
+ {
++	if (tp_quiet) {
++		return;
++	}
+ 	printf("ISHTAR TOUCHPROBE: step %s\n", what);
+ 	if (tp_pace_ms) {
+ 		delay(tp_pace_ms * 1000);
+@@ -1919,8 +1934,10 @@ gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx)
+ 	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
+ 	tp_step("tx doorbell (write part)");
+ 	gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
+-	delay(20000);
+-	printf("ISHTAR TOUCHPROBE: write part: ch0 %#x rp %#x gpii-stts %#x se8 status %#x\n", gpi_rd(GPI_CH(0)),
++	if (!tp_quiet) {
++		delay(20000);
++	}
++	TPQ("ISHTAR TOUCHPROBE: write part: ch0 %#x rp %#x gpii-stts %#x se8 status %#x\n", gpi_rd(GPI_CH(0)),
+ 	    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23118u)), touch_rd(gd.se, 0x40));
+ 	if (gpi_loop) {
+ 		gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
+@@ -1935,29 +1952,41 @@ gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx)
+ 		gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
+ 	}
+ 	tp_step("tx doorbell written");
+-	printf("ISHTAR TOUCHPROBE: after tx db: ch0 %#x rp %#x ch1 rp %#x glob %#x type %#x\n", gpi_rd(GPI_CH(0)),
++	TPQ("ISHTAR TOUCHPROBE: after tx db: ch0 %#x rp %#x ch1 rp %#x glob %#x type %#x\n", gpi_rd(GPI_CH(0)),
+ 	    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)));
+-	/* wait for two completion events (TX and RX end of transfer) */
++	/*
++	 * Completion = both channels' RP reached our WP. Events: drain everything up to the engine's event-ring
++	 * pointer (EV CNTXT_4), as Linux gpi_process_events, so the ring can never desync from a fixed count.
++	 */
+ 	int got = 0;
++	bool done = false;
+ 	uint32_t ev[4] = { 0 };
+-	for (int i = 0; i < 2000 && got < 3; i++) {     /* 200 ms: TX EOT, RX-GO EOB, RX EOT */
++	uint32_t txe = (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL);
++	uint32_t rxe = (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL);
++	for (int i = 0; i < 4000; i++) {     /* 200 ms */
++		uint32_t hw = ((gpi_rd(GPI_EV + 0x10) - (uint32_t)(gd.pa + GD_EV)) / GPI_RING_EL) % GPI_EV_ELS;
+ 		ishtar_dma_sync_va((const void *)(gd.dma + GD_EV), GPI_EV_ELS * GPI_RING_EL);
+-		volatile uint32_t *e = (volatile uint32_t *)(gd.dma + GD_EV + (gd.ev_rp % GPI_EV_ELS) * GPI_RING_EL);
+-		if (e[3] != 0) {
++		while (gd.ev_rp % GPI_EV_ELS != hw) {
++			volatile uint32_t *e = (volatile uint32_t *)(gd.dma + GD_EV + (gd.ev_rp % GPI_EV_ELS) * GPI_RING_EL);
+ 			ev[0] = e[0]; ev[1] = e[1]; ev[2] = e[2]; ev[3] = e[3];
+ 			e[0] = e[1] = e[2] = e[3] = 0;
+ 			gd.ev_rp++;
+ 			got++;
+-			continue;
+ 		}
+-		delay(100);
++		if (gpi_rd(GPI_CH(0) + 0x10) == txe && (!(nrx || gpi_loop) || gpi_rd(GPI_CH(1) + 0x10) == rxe)) {
++			done = true;
++			if (got) {
++				break;
++			}
++		}
++		delay(50);
+ 	}
+ 	/* give the consumed events back */
+ 	gpi_wr(GPI_EV_DB, (uint32_t)(gd.pa + GD_EV + ((gd.ev_rp + GPI_EV_ELS - 1) % GPI_EV_ELS) * GPI_RING_EL));
+ 	ishtar_dma_sync_va((const void *)(gd.dma + GD_RXBUF), n);
+ 	memcpy(rx, (const void *)(gd.dma + GD_RXBUF), n);
+-	printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x\n", got, ev[0], ev[1], ev[2], ev[3]);
+-	if (got < 1) {
++	TPQ("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x\n", got, ev[0], ev[1], ev[2], ev[3]);
++	if (!done) {
+ 		printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x, ch0 %#x ch1 %#x glob %#x err %#x\n", got,
+ 		    ev[0], ev[1], ev[2], ev[3], gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(1)), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23200u)));
+ 		/* QUP FW error (TYPE_IRQ bit 6): GPII and SE8 state for diagnosis */
+@@ -1982,6 +2011,113 @@ gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx)
+ 	return 0;
+ }
+ 
++/*
++ * FTM5 event loop (stock fts.c): scan mode active (A0 00 01), then on IRQ (gpio67, active low) read the
++ * FIFO (87 + dummy + 8-byte events) and report pointers. Super-resolution packing (fts,support-super-resolution):
++ * x = e3<<8|e2, y = e5<<8|e4 in 0..14400 x 0..32000 (fts,x-max/y-max) = 10x the 1440x3200 panel.
++ * Event ids: 13 enter, 23 motion, 33 leave; finger = e1 >> 4.
++ * ponytail: polls the irq line every 4 ms, GIC irq when latency matters.
++ */
++static volatile uint32_t fr_polls, fr_reads, fr_evs, fr_low, fr_fail, fr_stage;
++static vm_offset_t fr_tlmm;
++
++/* watchdog: shows where the event loop is even if it stalls (stage: 1 poll, 2 in FIFO read, 3 reporting) */
++static void
++fts_watch(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		delay(2000000);
++		printf("ISHTAR TOUCH: wd stage %u polls %u reads %u events %u fails %u irq-low %u | irq %u tx_wp %u rx_wp %u ev_rp %u "
++		    "ch0 %#x rp %#x ch1 %#x rp %#x gpii-stts %#x se8 %#x\n", fr_stage, fr_polls, fr_reads, fr_evs, fr_fail, fr_low,
++		    !(touch_rd(fr_tlmm + 67 * 0x1000u, 4) & 1u), gd.tx_wp, gd.rx_wp, gd.ev_rp, gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(0) + 0x10),
++		    gpi_rd(GPI_CH(1)), gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23118u)), touch_rd(gd.se, 0x40));
++	}
++}
++
++static void
++fts_run(vm_offset_t tlmm)
++{
++	static const uint8_t scan_on[3] = { 0xa0, 0x00, 0x01 }, fifo[1] = { 0x87 };
++	uint8_t rx[1 + 8 * 8];
++	int raw = 40;
++	PE_parse_boot_argn("ishtartouchraw", &raw, sizeof(raw));
++	static const uint8_t scan_off[3] = { 0xa0, 0x00, 0x00 };
++	/* stock fts_fw_update tail: mode handler sense on (01), then 00, 01 */
++	gpi_spi_xfer2(scan_on, 3, rx, 0);
++	gpi_spi_xfer2(scan_off, 3, rx, 0);
++	gpi_spi_xfer2(scan_on, 3, rx, 0);
++	/*
++	 * HyperOS runs THP (raw frames to the THP-ALG daemon; logcat "[THP-ALG] alg_input_report"). Without a host
++	 * algorithm switch the fw to native reporting, exactly stock fts_enable_thp_onoff(0): scan off, C0 21 01, scan on.
++	 */
++	int thp_off = 1;
++	PE_parse_boot_argn("ishtartouchthpoff", &thp_off, sizeof(thp_off));
++	if (thp_off) {
++		static const uint8_t thp[3] = { 0xc0, 0x21, 0x01 };
++		gpi_spi_xfer2(scan_off, 3, rx, 0);
++		gpi_spi_xfer2(thp, 3, rx, 0);
++		gpi_spi_xfer2(scan_on, 3, rx, 0);
++	}
++	printf("ISHTAR TOUCH: FTM5 running (scan on, thp %s, irq gpio67)\n", thp_off ? "off" : "on");
++	tp_quiet = true;
++	tp_pace_ms = 0;
++	fr_tlmm = tlmm;
++	thread_t wt;
++	(void)kernel_thread_start(fts_watch, NULL, &wt);
++	thread_deallocate(wt);
++	for (;;) {
++		fr_stage = 1;
++		bool irq = !(touch_rd(tlmm + 67 * 0x1000u, 4) & 1u);
++		fr_polls++;
++		fr_low += irq;
++		if (!irq && fr_polls % 125 != 0) {     /* irq high: still read the FIFO every ~500 ms */
++			delay(4000);
++			continue;
++		}
++		fr_reads++;
++		fr_stage = 2;
++		uint32_t w0 = gd.tx_wp, r0 = gd.rx_wp;
++		int rc = gpi_spi_xfer2(fifo, 1, rx, sizeof(rx));
++		if (fr_reads <= 100 || fr_reads % 50 == 0) {
++			printf("ISHTAR TOUCH: read %u irq %d rc %d tx_wp %u->%u rx_wp %u->%u ev_rp %u raw %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    fr_reads, irq, rc, w0, gd.tx_wp, r0, gd.rx_wp, gd.ev_rp, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7], rx[8]);
++		}
++		if (fr_reads % 20 == 0 && fr_reads <= 400) {     /* is the chip still alive and in fw? */
++			static const uint8_t idc[5] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };
++			uint8_t idr[4] = { 0 };
++			int irc = gpi_spi_xfer2(idc, 5, idr, 3);
++			printf("ISHTAR TOUCH: alive check rc %d chip id %02x %02x %02x irq %d\n", irc, idr[0], idr[1], idr[2],
++			    !(touch_rd(tlmm + 67 * 0x1000u, 4) & 1u));
++		}
++		if (rc != 0) {
++			fr_fail++;
++			delay(10000);
++			continue;
++		}
++		fr_stage = 3;
++		for (uint32_t k = 0; k < 8; k++) {
++			const uint8_t *e = rx + 1 + 8 * k;
++			if (e[0] == 0) {
++				break;
++			}
++			fr_evs++;
++			if (raw > 0) {
++				raw--;
++				printf("ISHTAR TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n", e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++			}
++			int id = e[1] >> 4, x = ((e[3] << 8) | e[2]) / 10, y = ((e[5] << 8) | e[4]) / 10;
++			if (id >= (int)TOUCH_MAX) {
++				continue;
++			}
++			if (e[0] == 0x13 || e[0] == 0x23) {
++				ishtar_hid_touch(id, 1, x, y);
++			} else if (e[0] == 0x33) {
++				ishtar_hid_touch(id, 0, x, y);
++			}
++		}
++	}
++}
++
+ static void
+ ishtar_touch_probe(int stage)
+ {

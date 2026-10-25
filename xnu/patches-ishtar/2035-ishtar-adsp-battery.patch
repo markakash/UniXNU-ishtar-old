@@ -1,0 +1,1963 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9b4be1e..a8bb986 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/ishtar_usb.c			standard
+ bsd/dev/ishtar_push.c			standard
+ bsd/dev/ishtar_cpufreq.c			standard
+ bsd/dev/ishtar_charger.c			standard
++bsd/dev/ishtar_adsp.c			standard
+ bsd/dev/ishtar_smmu.c			standard
+ bsd/dev/ishtar_fb.c			standard
+ bsd/dev/ishtar_a630.c			standard
+diff --git a/bsd/dev/ishtar_adsp.c b/bsd/dev/ishtar_adsp.c
+new file mode 100644
+index 0000000..7ecd509
+--- /dev/null
++++ b/bsd/dev/ishtar_adsp.c
+@@ -0,0 +1,1548 @@
++/*
++ * ISHTAR ADSP (SM8550): the audio DSP started through TrustZone PAS, and its battery manager read over GLINK.
++ * On this phone the charger (PM8550B) and the fuel gauge belong to the ADSP's charger_pd: the stock kernel only asks
++ * it (stock DT /soc/qcom,pmic_glink, channel PMIC_RTR_ADSP_APPS; HyperOS qti_battery_charger). There is no gauge the
++ * application processor can read by itself. The values go to iokit/Kernel/arm/IshtarBattery.cpp.
++ *
++ * Boot-arg ishtar-adsp=1: take over the DSP that UEFI started (uefi-ishtar uefipil.cfg [AUTO] FULL_ADSP); proven on the
++ * phone. ishtar-adsp=2: if UEFI did not start it, load it here (TZ PAS below), which still hangs the SoC in MEM_SETUP of
++ * the dtb image (pas 36). Off by default. All logs start with "ISHTAR ADSP:".
++ * Bring-up: ishtar-adsp-step=N stops before step N+1; ishtar-adsp-delay=S waits S seconds after the firmware is
++ * found (default 10); every step line is followed by a 500 ms pause so it reaches the
++ * USB live log before a possible hang.
++ *
++ * Firmware: HyperOS /vendor/firmware_mnt/image/{adsp,adsp_dtb}.{mdt,bNN} (the modem partition's production-signed
++ * copy, what HyperOS's remoteproc loaded), pushed to /private/var/ishtar/adsp/ (scripts/push.py).
++ *
++ * Sequence (Linux qcom_q6v5_pas.c adsp_load/adsp_start, sm8550 resource: pas 1, dtb pas 36, proxy lcx+lmx,
++ * load_state "adsp"):
++ *   dtb: INIT_IMAGE(36, .mdt), MEM_SETUP(36), copy segments    (adsp_load)
++ *   our SMP2P item 429 ("master-kernel"), as Linux smp2p does at probe
++ *   AOP "load_state adsp on", RPMh lcx/lmx at level 384, AUTH_AND_RESET(36)
++ *   main: INIT_IMAGE(1, .mdt), MEM_SETUP(1), copy segments, AUTH_AND_RESET(1)
++ *   wait for "slave-kernel" ready (bit 1); give the rails back on handover (bit 2)
++ *   GLINK over SMEM (items 478/479 ours, 480 the DSP's), version, channels IPCRTR and PMIC_RTR_ADSP_APPS
++ *   QRTR hello + the service registry locator (pd-mapper: QMI service 64), then battmgr property gets every 10 s
++ *
++ * Addresses (stock/ishtar/ishtar-merged.dts): remoteproc-adsp@3000000 (memory-region adspslpi 0x9ea00000+0x4680000,
++ * q6_adsp_dtb 0x9e980000+0x80000), smem 0x81d00000+0x200000 (hwlock tcsr_mutex 3 = 0x1f43000), qcom,smp2p-adsp
++ * (smem 443/429, pids 0/2, ipcc client 3 signal 2), glink-edge (ipcc client 3 signal 0), ipcc@408000, aoss_qmp
++ * @c300000 (ipcc client 0), apps_rsc drv-2 0x17a20000 tcs-offset 0xd00 (ACTIVE TCS 0..2, RSC v3 layout as
++ * ishtar_touch.c rh8_send), cmd-db 0x81c60000. PD domains from the firmware's *.jsn (instance 74).
++ * Protocols: Linux qcom_smem.c, smp2p.c, qcom_glink_native.c / qcom_glink_smem.c, net/qrtr/ns.c, qcom_pd_mapper.c,
++ * qmp mailbox (qcom_aoss.c), downstream qti_battery_charger.c property ids.
++ *
++ * ponytail: polled, no IPCC interrupt (20 ms idle, 1 ms while waiting for an answer); one thread owns everything.
++ * ponytail: the RPMh TCS is shared with ishtar_touch.c without a lock: touch votes at boot, this after root mount.
++ * ponytail: the DSP is never stopped; a reboot resets it (XBL).
++ */
++#if defined(ARM64_BOARD_CONFIG_ISHTAR)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include <pexpert/pexpert.h>
++#include "ishtar_board.h"
++
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void thread_set_thread_name(thread_t th, const char *name);
++
++#define FW_DIR          "/private/var/ishtar/adsp/"
++
++#define SMEM_PA         0x81d00000u
++#define SMEM_SIZE       0x200000u
++#define SMEM_LOCK_PA    0x01f43000u     /* tcsr_mutex lock 3 */
++#define HOST_APPS       0
++#define HOST_ADSP       2
++#define HOST_GLOBAL     0xfffe
++#define SMEM_CANARY     0xa5a5
++#define ITEM_SMP2P_OURS 429
++#define ITEM_SMP2P_DSP  443
++#define ITEM_CRASH      423
++#define ITEM_GLINK_DESC 478
++#define ITEM_GLINK_TX   479
++#define ITEM_GLINK_RX   480
++
++#define IPCC_PA         0x00408000u
++#define IPCC_SEND       0x0c
++#define IPCC_RECV       0x10
++#define IPCC_ENABLE     0x14
++#define IPCC_CLEAR      0x1c
++#define IPCC_AOP        0u
++#define IPCC_LPASS      3u
++#define SIG_GLINK       0u
++#define SIG_SMP2P       2u
++
++#define AOSS_PA         0x0c300000u
++#define RSC_TCS_PA      0x17a20d00u
++#define CMD_DB_PA       0x81c60000u
++#define CMD_DB_SIZE     0x20000u
++
++#define PAS_ADSP        1u
++#define PAS_DTB         36u
++#define ADSP_PA         0x9ea00000u
++#define ADSP_SIZE       0x4680000u
++#define DTB_PA          0x9e980000u
++#define DTB_SIZE        0x80000u
++
++static vm_offset_t smem, ipcc, aoss, tcs, cmddb;
++static unsigned max_step = 99;
++static int adsp_mode;           /* ishtar-adsp: 1 take over the DSP UEFI started, 2 also load it ourselves (hangs today) */
++
++static uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++dsb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
++static void
++sleep_ms(unsigned ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* the next bring-up step: logged, then a pause for the live log; false once past ishtar-adsp-step */
++static bool
++step(unsigned n, const char *what)
++{
++	if (n > max_step) {
++		printf("ISHTAR ADSP: stopping before step %u (%s)\n", n, what);
++		return false;
++	}
++	printf("ISHTAR ADSP: step %u: %s\n", n, what);
++	sleep_ms(500);
++	return true;
++}
++
++static void
++ring(unsigned signal)
++{
++	wr(ipcc + IPCC_SEND, IPCC_LPASS << 16 | signal);
++}
++
++/* ---- SMEM (qcom_smem.c: $TOC at the end, partitions per host pair, uncached items from the bottom) ---- */
++
++struct smem_part {
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size, free_uncached, free_cached, reserved[3];
++};
++struct smem_entry {
++	uint16_t canary, item;
++	uint32_t size;
++	uint16_t padding_data, padding_hdr;
++	uint32_t reserved;
++};
++
++static void
++smem_copy(uint32_t off, void *to, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		((uint8_t *)to)[i] = ((volatile uint8_t *)smem)[off + i];
++	}
++}
++
++/* offset of the partition of hosts a and b (0: none), and its cache line */
++static uint32_t
++smem_partition(uint16_t a, uint16_t b, uint32_t *cacheline)
++{
++	const uint32_t toc = SMEM_SIZE - 0x1000;
++	if (rd(smem + toc) != 0x434f5424) {         /* "$TOC" */
++		return 0;
++	}
++	for (uint32_t i = 0, n = rd(smem + toc + 8); i < n && i < 64; i++) {
++		uint32_t e = toc + 32 + 48 * i, off = rd(smem + e), size = rd(smem + e + 4), hosts = rd(smem + e + 12);
++		uint16_t h0 = hosts & 0xffff, h1 = hosts >> 16;
++		if (!off || !size || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++			continue;
++		}
++		*cacheline = rd(smem + e + 16);
++		return rd(smem + off) == 0x54525024 ? off : 0;    /* "$PRT" */
++	}
++	return 0;
++}
++
++/* offset of item's data in partition p (uncached list from the bottom, cached list from the top), 0 if absent */
++static uint32_t
++smem_find_in(uint32_t p, uint32_t cacheline, uint32_t item, uint32_t *size)
++{
++	struct smem_part h;
++	struct smem_entry e;
++	smem_copy(p, &h, sizeof(h));
++	for (uint32_t at = sizeof(h); at + sizeof(e) <= h.free_uncached && at < h.size;) {
++		smem_copy(p + at, &e, sizeof(e));
++		if (e.canary != SMEM_CANARY) {
++			break;
++		}
++		if (e.item == item) {
++			*size = e.size - e.padding_data;
++			return p + at + sizeof(e) + e.padding_hdr;
++		}
++		at += sizeof(e) + e.padding_hdr + e.size;
++	}
++	if (!cacheline || (cacheline & (cacheline - 1))) {
++		return 0;
++	}
++	uint32_t back = ((uint32_t)sizeof(e) + cacheline - 1) & ~(cacheline - 1);
++	for (uint32_t at = h.size - back; at > h.free_cached && at < h.size;) {
++		smem_copy(p + at, &e, sizeof(e));
++		if (e.canary != SMEM_CANARY || e.size + back > at) {
++			break;
++		}
++		if (e.item == item) {
++			*size = e.size - e.padding_data;
++			return p + at - e.size;
++		}
++		at -= e.size + back;
++	}
++	return 0;
++}
++
++static uint32_t
++smem_find(uint32_t item, uint32_t *size)
++{
++	uint32_t cl = 0, p = smem_partition(HOST_APPS, HOST_ADSP, &cl), at = p ? smem_find_in(p, cl, item, size) : 0;
++	if (!at && (p = smem_partition(HOST_GLOBAL, HOST_GLOBAL, &cl))) {
++		at = smem_find_in(p, cl, item, size);
++	}
++	return at;
++}
++
++/* qcom_smem_alloc_private in our partition with the DSP, under the TCSR hardware lock; returns the item's data */
++static uint32_t
++smem_alloc(uint32_t item, uint32_t size)
++{
++	uint32_t cl = 0, p = smem_partition(HOST_APPS, HOST_ADSP, &cl), got = 0, at, aligned = (size + 7) & ~7u;
++	struct smem_part h;
++	struct smem_entry e;
++	vm_offset_t lock = ml_io_map(SMEM_LOCK_PA, 0x1000);
++	unsigned tries = 0;
++
++	if (!p || !lock) {
++		return 0;
++	}
++	for (wr(lock, 1); rd(lock) != 1 && tries < 1000; tries++, sleep_ms(1)) {
++		wr(lock, 1);
++	}
++	if (rd(lock) != 1) {
++		printf("ISHTAR ADSP: smem lock held by %u\n", rd(lock));
++		return 0;
++	}
++	smem_copy(p, &h, sizeof(h));
++	for (at = sizeof(h); at < h.free_uncached;) {
++		smem_copy(p + at, &e, sizeof(e));
++		if (e.canary != SMEM_CANARY || e.item == item) {
++			break;
++		}
++		at += sizeof(e) + e.padding_hdr + e.size;
++	}
++	if (at == h.free_uncached && at + sizeof(e) + aligned <= h.free_cached) {
++		wr(smem + p + at, SMEM_CANARY | item << 16);
++		wr(smem + p + at + 4, aligned);
++		wr(smem + p + at + 8, aligned - size);
++		wr(smem + p + at + 12, 0);
++		for (uint32_t i = 0; i < aligned; i += 4) {
++			wr(smem + p + at + 16 + i, 0);
++		}
++		dsb();
++		wr(smem + p + offsetof(struct smem_part, free_uncached), at + (uint32_t)sizeof(e) + aligned);
++		dsb();
++		got = p + at + (uint32_t)sizeof(e);
++	}
++	wr(lock, 0);
++	printf("ISHTAR ADSP: smem alloc item %u (%u bytes): %s\n", item, size, got ? "made" : "FAILED");
++	return got;
++}
++
++static void
++crash_reason(void)
++{
++	char text[96] = { 0 };
++	uint32_t size = 0, at = smem_find(ITEM_CRASH, &size);
++	if (at && size) {
++		smem_copy(at, text, size < sizeof(text) - 1 ? size : sizeof(text) - 1);
++	}
++	printf("ISHTAR ADSP: DSP last words: \"%s\"\n", text);
++}
++
++/* ---- SMP2P (smp2p.c) ---- */
++
++#define SMP2P_MAGIC     0x504d5324
++struct smp2p {
++	uint32_t magic, version;
++	uint16_t local, remote, total, valid;
++	uint32_t flags;
++	struct {
++		char name[16];
++		uint32_t value;
++	} entry[16];
++};
++#define DSP_FATAL       (1u << 0)
++#define DSP_READY       (1u << 1)
++#define DSP_HANDOVER    (1u << 2)
++
++static uint32_t our_smp2p;
++static bool smp2p_agreed, smp2p_acked;
++
++/* the DSP's "slave-kernel" bits; 0 if its item is not there yet */
++static uint32_t
++dsp_state(struct smp2p *w)
++{
++	uint32_t size = 0, at = smem_find(ITEM_SMP2P_DSP, &size);
++	if (!at || size < sizeof(*w)) {
++		return 0;
++	}
++	smem_copy(at, w, sizeof(*w));
++	for (unsigned i = 0; w->magic == SMP2P_MAGIC && i < w->valid && i < 16; i++) {
++		if (strncmp(w->entry[i].name, "slave-kernel", 16) == 0) {
++			return w->entry[i].value;
++		}
++	}
++	return 0;
++}
++
++/* features agreed once; the DSP's restart flag acknowledged (smp2p.c qcom_smp2p_negotiate / do_ssr_ack) */
++static void
++smp2p_listen(const struct smp2p *dsp)
++{
++	if (dsp->magic != SMP2P_MAGIC || (dsp->version & 0xff) != 1) {
++		return;
++	}
++	if (!smp2p_agreed) {
++		uint32_t features = (dsp->version >> 8) & 1u;
++		wr(smem + our_smp2p + 4, features << 8 | 1);
++		smp2p_agreed = true;
++		printf("ISHTAR ADSP: smp2p agreed, features %#x\n", features);
++	}
++	if (((rd(smem + our_smp2p + 4) >> 8) & 1u) && ((dsp->flags & 1u) != 0) != smp2p_acked) {
++		smp2p_acked = !smp2p_acked;
++		wr(smem + our_smp2p + 16, smp2p_acked ? 2u : 0u);
++		dsb();
++		ring(SIG_SMP2P);
++	}
++}
++
++static bool
++smp2p_make(void)
++{
++	uint32_t size = 0;
++	our_smp2p = smem_find(ITEM_SMP2P_OURS, &size);
++	if (!our_smp2p && !(our_smp2p = smem_alloc(ITEM_SMP2P_OURS, sizeof(struct smp2p)))) {
++		return false;
++	}
++	for (uint32_t i = 0; i < sizeof(struct smp2p); i += 4) {
++		wr(smem + our_smp2p + i, 0);
++	}
++	wr(smem + our_smp2p, SMP2P_MAGIC);
++	wr(smem + our_smp2p + 8, HOST_APPS | HOST_ADSP << 16);
++	static const uint32_t name[4] = { 0x7473616d, 0x6b2d7265, 0x656e7265, 0x0000006c };     /* "master-kernel" */
++	for (unsigned i = 0; i < 4; i++) {
++		wr(smem + our_smp2p + 20 + 4 * i, name[i]);
++	}
++	wr(smem + our_smp2p + 12, 16 | 1u << 16);
++	dsb();
++	wr(smem + our_smp2p + 4, 1u << 8 | 1);  /* version 1, feature SSR ack, written last */
++	dsb();
++	ring(SIG_SMP2P);
++	return true;
++}
++
++/* ---- AOP QMP mailbox (qcom_aoss.c) ---- */
++
++static uint32_t qmp_box;
++
++static bool
++qmp_wait(uint32_t off, uint32_t value)
++{
++	for (unsigned i = 0; i < 1000 && rd(aoss + off) != value; i++) {
++		sleep_ms(1);
++	}
++	return rd(aoss + off) == value;
++}
++
++static bool
++qmp_open(void)
++{
++	const uint32_t up = 0xffff;
++	if (rd(aoss) != 0x4d41494c || rd(aoss + 4) != 1) {
++		printf("ISHTAR ADSP: qmp magic %#x version %u\n", rd(aoss), rd(aoss + 4));
++		return false;
++	}
++	if (rd(aoss + 0x24) != up || rd(aoss + 0x28) != up || rd(aoss + 0x2c) != up || rd(aoss + 0x14) != up ||
++	    rd(aoss + 0x30) != up) {
++		wr(aoss + 0x10, rd(aoss + 0x0c));
++		wr(aoss + 0x24, up);
++		wr(ipcc + IPCC_SEND, IPCC_AOP << 16);
++		if (!qmp_wait(0x28, up)) {
++			return false;
++		}
++		wr(aoss + 0x2c, up);
++		wr(ipcc + IPCC_SEND, IPCC_AOP << 16);
++		if (!qmp_wait(0x14, up)) {
++			return false;
++		}
++		wr(aoss + 0x18, up);
++		wr(ipcc + IPCC_SEND, IPCC_AOP << 16);
++		if (!qmp_wait(0x30, up)) {
++			return false;
++		}
++	}
++	qmp_box = rd(aoss + 0x38);
++	return qmp_box >= 0x3c && qmp_box + 68 <= 0x400;
++}
++
++static bool
++qmp_send(const char *text)
++{
++	uint32_t words[16] = { 0 };
++	if (!qmp_box && !qmp_open()) {
++		printf("ISHTAR ADSP: qmp mailbox does not open\n");
++		return false;
++	}
++	strlcpy((char *)words, text, sizeof(words));
++	for (unsigned i = 0; i < 16; i++) {
++		wr(aoss + qmp_box + 4 + 4 * i, words[i]);
++	}
++	wr(aoss + qmp_box, sizeof(words));
++	wr(ipcc + IPCC_SEND, IPCC_AOP << 16);
++	bool taken = qmp_wait(qmp_box, 0);
++	printf("ISHTAR ADSP: qmp \"%s\": %s\n", text, taken ? "taken" : "NOT TAKEN");
++	if (!taken) {
++		wr(aoss + qmp_box, 0);
++	}
++	return taken;
++}
++
++/* ---- RPMh: lcx/lmx level votes (cmd-db aux = level table; ACTIVE TCS write, RSC v3 as ishtar_touch.c) ---- */
++
++/* cmd-db resource on slave type (3 ARC, 5 BCM): address; for ARC also the first level index >= level */
++static uint32_t
++cmddb_lookup(const char *name, uint32_t slave, uint32_t level, uint32_t *index)
++{
++	uint32_t key[2] = { 0 };
++	memcpy(key, name, strnlen(name, 8));
++	if (rd(cmddb + 4) != 0x0c0330db) {
++		return 0;
++	}
++	for (uint32_t h = 8; h < 8 + 16 * 8; h += 16) {
++		uint32_t w0 = rd(cmddb + h), w1 = rd(cmddb + h + 4), e = 144 + (w0 >> 16);
++		for (uint32_t j = 0; (w0 & 0xffff) == slave && j < (w1 >> 16) && e + 24 * j + 24 <= CMD_DB_SIZE; j++) {
++			uint32_t at = e + 24 * j;
++			if (rd(cmddb + at) != key[0] || rd(cmddb + at + 4) != key[1]) {
++				continue;
++			}
++			if (slave != 3) {
++				return rd(cmddb + at + 16);
++			}
++			uint32_t lo = rd(cmddb + at + 20), data = 144 + (w1 & 0xffff) + (lo >> 16), n = (lo & 0xffff) / 2;
++			for (uint32_t l = 0; l < n && data + 2 * l + 2 <= CMD_DB_SIZE; l++) {
++				uint32_t v = (rd(cmddb + ((data + 2 * l) & ~3u)) >> (8 * ((data + 2 * l) & 3))) & 0xffff;
++				if (v >= level) {
++					*index = l;
++					return rd(cmddb + at + 16);
++				}
++			}
++		}
++	}
++	return 0;
++}
++
++/* one ACTIVE TCS write of n (<= 4) commands, polled */
++static bool
++tcs_send(const uint32_t *addr, const uint32_t *data, uint32_t n)
++{
++	int t = -1;
++	for (uint32_t i = 0; i < 3 && t < 0; i++) {
++		uint32_t b = i * 0x2a0;
++		if (rd(tcs + b + 0x28) && !rd(tcs + b + 0x24) && !rd(tcs + b + 0x2c)) {
++			t = (int)i;
++		}
++	}
++	if (t < 0) {
++		printf("ISHTAR ADSP: no free ACTIVE TCS\n");
++		return false;
++	}
++	uint32_t b = (uint32_t)t * 0x2a0, done = 0, mask = (1u << n) - 1;
++	wr(tcs, rd(tcs) & ~(1u << t));
++	for (uint32_t c = 0; c < n; c++) {
++		wr(tcs + b + 0x34 + 24 * c, 8 | (1u << 8) | (1u << 16));
++		wr(tcs + b + 0x38 + 24 * c, addr[c]);
++		wr(tcs + b + 0x3c + 24 * c, data[c]);
++	}
++	wr(tcs + b + 0x20, mask);
++	wr(tcs + b + 0x2c, mask);
++	wr(tcs + b + 0x24, 1u << 16);
++	wr(tcs + b + 0x24, (1u << 16) | (1u << 24));
++	for (int i = 0; i < 1000 && done != mask; i++) {
++		done = 0;
++		for (uint32_t c = 0; c < n; c++) {
++			done |= ((rd(tcs + b + 0x40 + 24 * c) & 0x10100) == 0x10100) << c;
++		}
++		delay(100);
++	}
++	wr(tcs + b + 0x24, 0);
++	wr(tcs + b + 0x2c, 0);
++	wr(tcs + b + 0x20, 0);
++	wr(tcs + 0x8, 1u << t);
++	return done == mask;
++}
++
++static bool
++rails(uint32_t level)
++{
++	uint32_t addr[2], data[2] = { 0, 0 };
++	addr[0] = cmddb_lookup("lcx.lvl", 3, level, &data[0]);
++	addr[1] = cmddb_lookup("lmx.lvl", 3, level, &data[1]);
++	bool done = addr[0] && addr[1] && tcs_send(addr, data, 2);
++	printf("ISHTAR ADSP: rpmh lcx %#x=%u lmx %#x=%u (level %u): %s\n", addr[0], data[0], addr[1], data[1], level,
++	    done ? "done" : "NOT DONE");
++	return done;
++}
++
++/*
++ * The stock PAS loader votes interconnect bandwidth around its TZ calls (scm_pas_enable_bw: crypto_ddr; bus scaling:
++ * rproc_ddr; stock DT remoteproc-adsp interconnects qxm_crypto -> ebi, lpass -> ebi). As BCM votes: CE0 (crypto),
++ * SH0 (gem noc / llcc), MC0 (DDR), each committed at units (0 = given back).
++ * ponytail: fixed units, no bandwidth math; the path only has to be clocked while TZ and the DSP boot touch DDR.
++ */
++static bool
++bandwidth(uint32_t units)
++{
++	static const char *const bcm[3] = { "CE0", "SH0", "MC0" };
++	uint32_t addr[3], data[3];
++	for (unsigned i = 0; i < 3; i++) {
++		addr[i] = cmddb_lookup(bcm[i], 5, 0, NULL);
++		data[i] = (1u << 30) | (units ? 1u << 29 : 0) | (units << 14) | units;
++	}
++	bool done = addr[0] && addr[1] && addr[2] && tcs_send(addr, data, 3);
++	printf("ISHTAR ADSP: bcm CE0 %#x SH0 %#x MC0 %#x = %u: %s\n", addr[0], addr[1], addr[2], units,
++	    done ? "done" : "NOT DONE");
++	return done;
++}
++
++/* ---- TrustZone PAS (qcom_scm-smc.c; SIP service 2) ---- */
++
++static int64_t
++scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c)
++{
++	uint64_t token = 0;
++	printf("ISHTAR ADSP: scm pas cmd %u (%#llx, %#llx, %#llx) ...\n", cmd, a, b, c);
++	sleep_ms(300);
++	for (unsigned busy = 0, resume = 0; resume < 64 && busy < 20;) {
++		register uint64_t x0 __asm__("x0") = resume ? 1 : 0x42000200u | cmd;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a;
++		register uint64_t x3 __asm__("x3") = b;
++		register uint64_t x4 __asm__("x4") = c;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = token;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		if ((int32_t)x0 == 1) {             /* interrupted: resume with the token */
++			token = x6;
++			resume++;
++			continue;
++		}
++		if ((int32_t)x0 == -12) {           /* busy */
++			resume = 0;
++			token = 0;
++			busy++;
++			sleep_ms(30);
++			continue;
++		}
++		int64_t r = (int32_t)x0 ? (int32_t)x0 : (int32_t)x1;
++		printf("ISHTAR ADSP: scm pas cmd %u (%#llx, %#llx, %#llx) = %lld\n", cmd, a, b, c, r);
++		return r;
++	}
++	printf("ISHTAR ADSP: scm pas cmd %u did not complete\n", cmd);
++	return -1;
++}
++
++/* ---- firmware files ---- */
++
++/* the whole file into dst (at most max bytes); its size, or -1 */
++static int64_t
++fw_read(const char *name, void *dst, uint64_t max)
++{
++	char path[96];
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int resid = 0, error;
++	vfs_context_t ctx = vfs_context_kernel();
++
++	snprintf(path, sizeof(path), FW_DIR "%s", name);
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		printf("ISHTAR ADSP: %s missing\n", path);
++		return -1;
++	}
++	error = vnode_size(vp, &size, ctx);
++	if (!error && (size <= 0 || (uint64_t)size > max)) {
++		error = EFBIG;
++	}
++	if (!error) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)dst, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_put(vp);
++	if (error || resid) {
++		printf("ISHTAR ADSP: %s: error %d size %lld resid %d\n", path, error, (long long)size, resid);
++		return -1;
++	}
++	return size;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/*
++ * qcom_mdt_pas_init + qcom_mdt_load_no_init: the .mdt (ELF header, program headers, hashes) to TZ as metadata, the
++ * extent to MEM_SETUP, every loadable segment's .bNN into the carve-out, zeroes up to its memsz.
++ * The metadata page: TZ puts it under XPU protection at INIT_IMAGE (downstream mdt_loader.c: "physically contiguous,
++ * 4K aligned and non-cachable to avoid XPU violations"), so it is device memory from then on and never touched again;
++ * the headers are parsed from a private copy. Reading the page back after INIT_IMAGE hung the SoC. It stays allocated.
++ */
++static bool
++pas_load(const char *base, uint32_t pas, uint32_t carve_pa, uint32_t carve_size)
++{
++	char name[32];
++	vm_offset_t meta;
++	if (kmem_alloc_contig(kernel_map, &meta, PAGE_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	static uint8_t m[16384];                /* private copy of the .mdt; one pas_load at a time */
++	snprintf(name, sizeof(name), "%s.mdt", base);
++	int64_t size = fw_read(name, m, MIN(sizeof(m), PAGE_SIZE));
++	uint32_t phoff = size >= 52 ? le32(m + 28) : 0, phnum = size >= 52 ? (m[44] | m[45] << 8) : 0;
++	if (size < 52 || memcmp(m, "\177ELF\1", 5) != 0 || phnum < 2 || phnum > 64 || phoff + 32 * phnum > size) {
++		printf("ISHTAR ADSP: %s is not an mdt (%lld bytes, %u headers)\n", name, size, phnum);
++		return false;
++	}
++	uint64_t lo = ~0ull, hi = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		if (le32(ph) == 1 && ((le32(ph + 24) >> 24) & 7) != 2 && le32(ph + 20)) {
++			lo = MIN(lo, le32(ph + 12));
++			hi = MAX(hi, ((uint64_t)le32(ph + 12) + le32(ph + 20) + 0xfff) & ~0xfffull);
++		}
++	}
++	if (lo != carve_pa || hi - lo > carve_size) {
++		printf("ISHTAR ADSP: %s spans %#llx..%#llx, carve-out %#x+%#x\n", name, lo, hi, carve_pa, carve_size);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)meta);
++	memcpy((void *)meta, m, (size_t)size);
++	ishtar_dma_sync_va((const void *)meta, PAGE_SIZE);
++	pmap_set_cache_attributes(pn, VM_WIMG_IO);
++	uint64_t meta_pa = ptoa_64(pn);
++	if (scm(1, 2 | 2u << 6, pas, meta_pa, 0) != 0 || scm(2, 3, pas, carve_pa, hi - lo) != 0) {
++		return false;
++	}
++	vm_offset_t carve = ml_io_map_wcomb(carve_pa, carve_size);
++	bool ok = carve != 0;
++	for (uint32_t i = 0; ok && i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		uint32_t pa = le32(ph + 12), filesz = le32(ph + 16), memsz = le32(ph + 20);
++		if (le32(ph) != 1 || ((le32(ph + 24) >> 24) & 7) == 2 || !memsz) {
++			continue;
++		}
++		uint8_t *to = (uint8_t *)(carve + (pa - carve_pa));
++		snprintf(name, sizeof(name), "%s.b%02u", base, i);
++		ok = filesz <= memsz && (!filesz || fw_read(name, to, filesz) == filesz);
++		if (ok) {
++			memset(to + filesz, 0, memsz - filesz);
++		} else {
++			printf("ISHTAR ADSP: segment %u (%s, %u bytes) not loaded\n", i, name, filesz);
++		}
++	}
++	dsb();
++	if (carve) {
++		ml_io_unmap(carve, carve_size);
++	}
++	printf("ISHTAR ADSP: %s loaded: %s, %#llx bytes at %#x\n", base, ok ? "ok" : "FAILED", hi - lo, carve_pa);
++	return ok;
++}
++
++/* ---- GLINK over SMEM (qcom_glink_native.c, qcom_glink_smem.c) ---- */
++
++enum {
++	G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_DONE = 6,
++	G_INTENT_REQ = 7, G_INTENT_REQ_ACK = 8, G_DATA = 9, G_CLOSE_ACK = 11, G_DATA_MORE = 12, G_READ_NOTIFY = 13,
++	G_DONE_REUSE = 14, G_SIGNALS = 15,
++};
++#define G_FEATURES      1u              /* GLINK_FEATURE_INTENT_REUSE */
++
++struct gmsg {
++	uint16_t cmd, param1;
++	uint32_t param2;
++};
++struct gpacket {
++	struct gpacket *next;
++	uint32_t len;
++	uint8_t data[];
++};
++struct gchan {
++	const char *name;
++	uint32_t ours, theirs;
++	uint32_t intent_size[2], intent_count[2];
++	bool asked, acked, open;
++	bool req_answered, req_granted;
++	struct {
++		uint32_t id, size;
++		bool there, busy;
++	} remote[32];
++	struct {
++		uint32_t size, fill;
++		uint8_t *data;
++	} local[16];
++	uint32_t nlocal;
++	struct gpacket *first, *last;
++};
++enum { CH_QRTR, CH_PMIC, CHANNELS };
++
++static struct {
++	uint32_t desc, tx, tx_size, rx, rx_size;
++	bool up, broken;
++	struct gchan ch[CHANNELS];
++} g = {
++	.ch = {
++		[CH_QRTR] = { .name = "IPCRTR", .ours = 1, .intent_size = { 0x800, 0x4400 }, .intent_count = { 5, 2 } },
++		[CH_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 2, .intent_size = { 0x200, 0x1000 }, .intent_count = { 6, 2 } },
++	},
++};
++
++#define TX_TAIL         (g.desc + 0)
++#define TX_HEAD         (g.desc + 4)
++#define RX_TAIL         (g.desc + 8)
++#define RX_HEAD         (g.desc + 12)
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t head = rd(smem + RX_HEAD), tail = rd(smem + RX_TAIL);
++	if (head >= g.rx_size || tail >= g.rx_size) {
++		return 0;
++	}
++	return head >= tail ? head - tail : g.rx_size - tail + head;
++}
++
++static void
++rx_peek(void *to, uint32_t off, uint32_t n)
++{
++	uint32_t at = rd(smem + RX_TAIL) + off;
++	for (uint32_t i = 0; i < n; i++) {
++		((uint8_t *)to)[i] = ((volatile uint8_t *)smem)[g.rx + (at + i) % g.rx_size];
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	wr(smem + RX_TAIL, (rd(smem + RX_TAIL) + n) % g.rx_size);
++}
++
++static bool
++tx_put(const void *a, uint32_t alen, const void *b, uint32_t blen)
++{
++	uint32_t head = rd(smem + TX_HEAD), tail = rd(smem + TX_TAIL), len = alen + blen, padded = (len + 7) & ~7u;
++	uint32_t room = tail <= head ? g.tx_size - head + tail : tail - head;
++	if (!g.up || head >= g.tx_size || tail >= g.tx_size || room < padded + 16) {
++		return false;
++	}
++	for (uint32_t i = 0; i < padded; i++) {
++		uint8_t v = i < alen ? ((const uint8_t *)a)[i] : i < len ? ((const uint8_t *)b)[i - alen] : 0;
++		((volatile uint8_t *)smem)[g.tx + (head + i) % g.tx_size] = v;
++	}
++	dsb();
++	wr(smem + TX_HEAD, (head + padded) % g.tx_size);
++	dsb();
++	ring(SIG_GLINK);
++	return true;
++}
++
++static void
++gsay(unsigned cmd, uint32_t p1, uint32_t p2, const void *more, uint32_t len)
++{
++	struct gmsg m = { (uint16_t)cmd, (uint16_t)p1, p2 };
++	if (!tx_put(&m, sizeof(m), more, len)) {
++		printf("ISHTAR ADSP: glink tx full, cmd %u dropped\n", cmd);
++	}
++}
++
++static struct gchan *
++gchan_theirs(uint32_t id)
++{
++	for (unsigned c = 0; c < CHANNELS; c++) {
++		if (g.ch[c].theirs && g.ch[c].theirs == id) {
++			return &g.ch[c];
++		}
++	}
++	return NULL;
++}
++
++static bool
++goffer(struct gchan *ch, uint32_t size)
++{
++	uint32_t i = ch->nlocal, words[2] = { size, i + 1 };
++	if (i >= 16 || !size || size > 0x10000 || !(ch->local[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO))) {
++		return false;
++	}
++	ch->local[i].size = size;
++	ch->local[i].fill = 0;
++	ch->nlocal++;
++	gsay(G_INTENT, ch->ours, 1, words, sizeof(words));
++	return true;
++}
++
++/* everything the DSP queued, acted on; whole messages land on their channel's list */
++static void
++gpump(void)
++{
++	struct gmsg m;
++	struct gchan *ch;
++	uint32_t w[2];
++	char name[33];
++
++	while (g.up && !g.broken) {
++		uint32_t avail = rx_avail(), len = sizeof(m);
++		if (avail < sizeof(m)) {
++			return;
++		}
++		rx_peek(&m, 0, sizeof(m));
++		if (m.cmd == G_OPEN) {
++			len += m.param2;
++		} else if (m.cmd == G_INTENT) {
++			len += 8 * m.param2;
++		} else if (m.cmd == G_DATA || m.cmd == G_DATA_MORE) {
++			if (avail < 16) {
++				return;
++			}
++			rx_peek(w, 8, 8);
++			len = 16 + w[0];
++		}
++		len = (len + 7) & ~7u;
++		if (len > g.rx_size - 8) {
++			printf("ISHTAR ADSP: glink message cmd %u of %u bytes, link given up\n", m.cmd, len);
++			g.broken = true;
++			return;
++		}
++		if (avail < len) {
++			return;
++		}
++		switch (m.cmd) {
++		case G_VERSION:
++			rx_advance(len);
++			gsay(G_VERSION_ACK, 1, m.param2 & G_FEATURES, NULL, 0);
++			break;
++		case G_VERSION_ACK:
++			rx_advance(len);
++			printf("ISHTAR ADSP: glink version %u features %#x\n", m.param1, m.param2);
++			break;
++		case G_OPEN:
++			bzero(name, sizeof(name));
++			rx_peek(name, sizeof(m), MIN(m.param2, sizeof(name) - 1));
++			rx_advance(len);
++			ch = NULL;
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (strcmp(name, g.ch[c].name) == 0) {
++					ch = &g.ch[c];
++				}
++			}
++			printf("ISHTAR ADSP: glink DSP opens \"%s\" (%u)%s\n", name, m.param1, ch ? "" : ", not served");
++			if (!ch) {
++				break;
++			}
++			ch->theirs = m.param1;
++			gsay(G_OPEN_ACK, ch->theirs, 0, NULL, 0);
++			if (!ch->asked) {
++				uint32_t n = (uint32_t)strlen(ch->name) + 1;
++				bzero(name, sizeof(name));
++				strlcpy(name, ch->name, sizeof(name));
++				gsay(G_OPEN, ch->ours, n, name, (n + 7) & ~7u);
++				ch->asked = true;
++			}
++			break;
++		case G_OPEN_ACK:
++			rx_advance(len);
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (m.param1 == g.ch[c].ours) {
++					g.ch[c].acked = true;
++				}
++			}
++			break;
++		case G_INTENT:
++			ch = gchan_theirs(m.param1);
++			for (uint32_t i = 0; ch && i < m.param2; i++) {
++				rx_peek(w, 8 + 8 * i, 8);
++				for (unsigned n = 0; n < 32; n++) {
++					if (!ch->remote[n].there || ch->remote[n].id == w[1]) {
++						ch->remote[n].there = true;
++						ch->remote[n].busy = false;
++						ch->remote[n].size = w[0];
++						ch->remote[n].id = w[1];
++						break;
++					}
++				}
++			}
++			rx_advance(len);
++			break;
++		case G_DONE:
++		case G_DONE_REUSE:
++			ch = gchan_theirs(m.param1);
++			for (unsigned n = 0; ch && n < 32; n++) {
++				if (ch->remote[n].there && ch->remote[n].id == m.param2) {
++					ch->remote[n].busy = false;
++					ch->remote[n].there = m.cmd == G_DONE_REUSE;
++				}
++			}
++			rx_advance(len);
++			break;
++		case G_INTENT_REQ:
++			rx_advance(len);
++			if ((ch = gchan_theirs(m.param1))) {
++				gsay(G_INTENT_REQ_ACK, ch->ours, goffer(ch, m.param2), NULL, 0);
++			}
++			break;
++		case G_INTENT_REQ_ACK:
++			rx_advance(len);
++			for (unsigned c = 0; c < CHANNELS; c++) {
++				if (m.param1 == g.ch[c].theirs || m.param1 == g.ch[c].ours) {
++					g.ch[c].req_answered = true;
++					g.ch[c].req_granted = m.param2 != 0;
++				}
++			}
++			break;
++		case G_DATA:
++		case G_DATA_MORE: {
++			uint32_t li = m.param2 - 1;
++			ch = gchan_theirs(m.param1);
++			if (!ch || li >= ch->nlocal || w[0] > ch->local[li].size - ch->local[li].fill) {
++				printf("ISHTAR ADSP: glink data %u bytes on %u intent %u dropped\n", w[0], m.param1, m.param2);
++				rx_advance(len);
++				break;
++			}
++			rx_peek(ch->local[li].data + ch->local[li].fill, 16, w[0]);
++			ch->local[li].fill += w[0];
++			rx_advance(len);
++			if (w[1] == 0) {
++				struct gpacket *p = kalloc_data(sizeof(*p) + ch->local[li].fill, Z_WAITOK);
++				if (p) {
++					p->next = NULL;
++					p->len = ch->local[li].fill;
++					memcpy(p->data, ch->local[li].data, p->len);
++					*(ch->last ? &ch->last->next : &ch->first) = p;
++					ch->last = p;
++				}
++				ch->local[li].fill = 0;
++				gsay(G_DONE_REUSE, ch->ours, m.param2, NULL, 0);
++			}
++			break;
++		}
++		case G_READ_NOTIFY:
++			rx_advance(len);
++			ring(SIG_GLINK);
++			break;
++		case G_CLOSE:
++			rx_advance(len);
++			gsay(G_CLOSE_ACK, m.param1, 0, NULL, 0);
++			if ((ch = gchan_theirs(m.param1))) {
++				printf("ISHTAR ADSP: glink DSP closes \"%s\"\n", ch->name);
++				ch->open = ch->asked = ch->acked = false;
++				ch->theirs = 0;
++			}
++			break;
++		case G_CLOSE_ACK:
++		case G_SIGNALS:
++			rx_advance(len);
++			break;
++		default:
++			printf("ISHTAR ADSP: glink unknown cmd %u, link given up\n", m.cmd);
++			g.broken = true;
++			return;
++		}
++		for (unsigned c = 0; c < CHANNELS; c++) {
++			ch = &g.ch[c];
++			if (ch->theirs && ch->acked && !ch->open) {
++				ch->open = true;
++				printf("ISHTAR ADSP: glink \"%s\" open\n", ch->name);
++				for (unsigned k = 0; k < 2; k++) {
++					for (unsigned n = 0; n < ch->intent_count[k]; n++) {
++						goffer(ch, ch->intent_size[k]);
++					}
++				}
++			}
++		}
++	}
++}
++
++/* one whole message on a channel, into an intent of the DSP's that fits (asked for if none does); 0 if sent */
++static int
++gsend(struct gchan *ch, const void *data, uint32_t len)
++{
++	struct {
++		struct gmsg m;
++		uint32_t size, left;
++	} h = { { G_DATA, (uint16_t)ch->ours, 0 }, len, 0 };
++	bool asked = false;
++
++	for (unsigned waited = 0; waited < 5000; waited++) {
++		gpump();
++		if (!g.up || g.broken || !ch->open) {
++			return ENOTCONN;
++		}
++		int found = -1;
++		bool fits = false;
++		for (unsigned n = 0; n < 32; n++) {
++			if (ch->remote[n].there && ch->remote[n].size >= len) {
++				fits = true;
++				if (!ch->remote[n].busy && (found < 0 || ch->remote[n].size < ch->remote[found].size)) {
++					found = (int)n;
++				}
++			}
++		}
++		if (found >= 0) {
++			ch->remote[found].busy = true;
++			h.m.param2 = ch->remote[found].id;
++			return tx_put(&h, sizeof(h), data, len) ? 0 : ENOBUFS;
++		}
++		if (!fits && !asked) {
++			ch->req_answered = false;
++			gsay(G_INTENT_REQ, ch->ours, len, NULL, 0);
++			asked = true;
++		}
++		if (asked && ch->req_answered && !ch->req_granted) {
++			return ENOBUFS;
++		}
++		sleep_ms(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* ---- QRTR (net/qrtr: v1 header) + the service registry locator (qcom_pd_mapper.c) ---- */
++
++#define QRTR_NODE       1u              /* ours */
++#define QRTR_CTRL       0xfffffffeu
++#define LOCATOR_PORT    0x4001u
++enum { Q_DATA = 1, Q_HELLO = 2, Q_BYE = 3, Q_NEW_SERVER = 4, Q_DEL_SERVER = 5, Q_RESUME_TX = 7, Q_NEW_LOOKUP = 10 };
++
++struct qhdr {
++	uint32_t version, type, src_node, src_port, confirm, size, dst_node, dst_port;
++};
++
++static uint32_t qrtr_dsp_node;
++
++static void
++qsend(uint32_t type, uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len)
++{
++	uint8_t buf[sizeof(struct qhdr) + 512];
++	struct qhdr *h = (struct qhdr *)buf;
++	uint32_t padded = (len + 3) & ~3u;
++	if (padded > 512) {
++		return;
++	}
++	bzero(buf, sizeof(buf));
++	*h = (struct qhdr){ 1, type, QRTR_NODE, src_port, 0, len, node, port };
++	memcpy(h + 1, data, len);
++	gsend(&g.ch[CH_QRTR], buf, (uint32_t)sizeof(*h) + padded);
++}
++
++/* QMI GET_DOMAIN_LIST (0x21): the domains that host a service, from the firmware's adsp*.jsn / battmgr.jsn */
++static void
++locator(uint32_t node, uint32_t port, const uint8_t *q, uint32_t len)
++{
++	static const struct {
++		const char *service, *domain;
++	} map[] = {
++		{ "tms/servreg", "msm/adsp/root_pd" }, { "tms/servreg", "msm/adsp/sensor_pd" },
++		{ "tms/servreg", "msm/adsp/audio_pd" }, { "tms/servreg", "msm/adsp/charger_pd" },
++		{ "avs/audio", "msm/adsp/audio_pd" },
++	};
++	uint8_t a[512] = { 2, q[1], q[2], q[3], q[4], 0, 0, 2, 4, 0, 0, 0, 0, 0 };
++	char want[64] = "";
++	unsigned at = 14, found = 0;
++
++	for (unsigned i = 7; i + 3 <= len;) {               /* TLV 1: the service name */
++		unsigned n = q[i + 1] | q[i + 2] << 8;
++		if (q[i] == 1) {
++			snprintf(want, sizeof(want), "%.*s", (int)MIN(n, MIN(63u, len - i - 3)), (const char *)q + i + 3);
++		}
++		i += 3 + n;
++	}
++	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		found += strcmp(map[i].service, want) == 0;
++	}
++	if ((q[3] | q[4] << 8) == 0x21) {
++		uint8_t head[] = { 0x10, 2, 0, (uint8_t)found, 0, 0x11, 2, 0, 1, 0 };
++		memcpy(a + at, head, sizeof(head));
++		at += sizeof(head);
++		if (found) {
++			unsigned list = at;
++			a[at] = 0x12;
++			at += 3;
++			a[at++] = (uint8_t)found;
++			for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++				if (strcmp(map[i].service, want) != 0) {
++					continue;
++				}
++				unsigned n = (unsigned)strlen(map[i].domain);
++				a[at++] = (uint8_t)n;
++				memcpy(a + at, map[i].domain, n);
++				at += n;
++				a[at++] = 74;               /* qmi_instance_id */
++				at += 3 + 1 + 4;            /* rest of the instance, service_data_valid, service_data */
++			}
++			a[list + 1] = (uint8_t)(at - list - 3);
++			a[list + 2] = (uint8_t)((at - list - 3) >> 8);
++		}
++	} else {
++		a[10] = 1;                          /* QMI_RESULT_FAILURE */
++		a[12] = 1;                          /* QMI_ERR_MALFORMED_MSG */
++	}
++	a[5] = (uint8_t)(at - 7);
++	a[6] = (uint8_t)((at - 7) >> 8);
++	printf("ISHTAR ADSP: locator: msg %#x \"%s\" -> %u domains\n", q[3] | q[4] << 8, want, found);
++	qsend(Q_DATA, LOCATOR_PORT, node, port, a, at);
++}
++
++static void
++qrtr_input(const uint8_t *d, uint32_t len)
++{
++	struct qhdr h;
++	uint32_t at, w[5] = { 0 };
++	if (len >= sizeof(h) && d[0] == 1) {
++		memcpy(&h, d, sizeof(h));
++		at = sizeof(h);
++	} else if (len >= 16 && d[0] == 3) {                /* v2 header */
++		bzero(&h, sizeof(h));
++		h.type = d[1];
++		h.confirm = d[2] & 1;
++		memcpy(&h.size, d + 4, 4);
++		h.src_node = d[8] | d[9] << 8;
++		h.src_port = d[10] | d[11] << 8;
++		h.dst_node = d[12] | d[13] << 8;
++		h.dst_port = d[14] | d[15] << 8;
++		h.src_port = h.src_port == 0xfffe ? QRTR_CTRL : h.src_port;
++		h.dst_port = h.dst_port == 0xfffe ? QRTR_CTRL : h.dst_port;
++		at = 16 + d[3];
++	} else {
++		return;
++	}
++	if (at + h.size > len) {
++		return;
++	}
++	if (h.confirm) {
++		uint32_t resume[5] = { Q_RESUME_TX, h.dst_node, h.dst_port };
++		qsend(Q_RESUME_TX, h.dst_port, h.src_node, h.src_port, resume, sizeof(resume));
++	}
++	if (h.type == Q_DATA && h.dst_port == LOCATOR_PORT) {
++		if (h.size >= 7) {
++			locator(h.src_node, h.src_port, d + at, h.size);
++		}
++		return;
++	}
++	memcpy(w, d + at, MIN(h.size, sizeof(w)));
++	switch (h.type) {
++	case Q_HELLO: {
++		uint32_t hello[5] = { Q_HELLO }, server[5] = { Q_NEW_SERVER, 64, 1 | 1u << 8, QRTR_NODE, LOCATOR_PORT };
++		qrtr_dsp_node = h.src_node;
++		qsend(Q_HELLO, QRTR_CTRL, h.src_node, QRTR_CTRL, hello, sizeof(hello));
++		qsend(Q_NEW_SERVER, QRTR_CTRL, h.src_node, QRTR_CTRL, server, sizeof(server));
++		printf("ISHTAR ADSP: qrtr hello from node %u, locator announced\n", h.src_node);
++		break;
++	}
++	case Q_NEW_SERVER:
++		printf("ISHTAR ADSP: qrtr service %u v%u inst %u at %u:%u\n", w[1], w[2] & 0xff, w[2] >> 8, w[3], w[4]);
++		break;
++	case Q_NEW_LOOKUP:
++		printf("ISHTAR ADSP: qrtr DSP looks up service %u inst %u\n", w[1], w[2]);
++		break;
++	case Q_BYE:
++		printf("ISHTAR ADSP: qrtr bye from %u\n", h.src_node);
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---- battmgr (pmic_glink owner 32778; downstream qti_battery_charger.c property ids) ---- */
++
++#define BM_OWNER        32778u
++#define BM_BATT_GET     0x30u
++#define BM_USB_GET      0x32u
++enum {
++	BATT_STATUS = 0, BATT_PRESENT = 2, BATT_CAPACITY = 4, BATT_VOLT_NOW = 7, BATT_CURR_NOW = 9, BATT_TEMP = 13,
++	BATT_CHG_COUNTER = 15, BATT_CYCLE_COUNT = 16, BATT_CHG_FULL_DESIGN = 17, BATT_CHG_FULL = 18,
++};
++enum { USB_ONLINE = 0, USB_VOLT_NOW = 1, USB_CURR_NOW = 3, USB_TYPE = 6 };
++
++static struct {
++	uint32_t answers, opcode, prop, value, result;
++} bm;
++
++static volatile struct ishtar_battmgr_sample shared;
++
++static void service(void);
++
++static void
++battmgr_input(const uint8_t *d, uint32_t len)
++{
++	uint32_t w[6] = { 0 };
++	memcpy(w, d, MIN(len, sizeof(w)));
++	if (w[0] != BM_OWNER || len < 12) {
++		return;
++	}
++	if (w[1] == 2) {                                    /* notification */
++		static unsigned notices;
++		if (notices++ < 4) {
++			printf("ISHTAR ADSP: battmgr notice %#x\n", w[2]);
++		}
++		return;
++	}
++	bm.opcode = w[2];
++	bm.prop = w[3];
++	bm.value = w[4];
++	bm.result = len >= 24 ? w[5] : ~0u;
++	bm.answers++;
++}
++
++static bool
++battmgr_get(uint32_t opcode, uint32_t prop, uint32_t *value)
++{
++	uint32_t q[6] = { BM_OWNER, 1, opcode, 0, prop, 0 }, before = bm.answers;
++	if (gsend(&g.ch[CH_PMIC], q, sizeof(q)) != 0) {
++		return false;
++	}
++	for (unsigned ms = 0; ms < 1000; ms++) {
++		service();
++		if (bm.answers != before && bm.opcode == opcode && bm.prop == prop) {
++			*value = bm.value;
++			return bm.result == 0;
++		}
++		before = bm.answers != before ? bm.answers : before;
++		sleep_ms(1);
++	}
++	return false;
++}
++
++static void
++battmgr_poll(unsigned round)
++{
++	struct ishtar_battmgr_sample s = { 0 };
++	uint32_t v[10] = { 0 };
++	static uint32_t full, design, cycles;
++	bool ok = battmgr_get(BM_BATT_GET, BATT_CAPACITY, &v[0]) && battmgr_get(BM_BATT_GET, BATT_STATUS, &v[1]) &&
++	    battmgr_get(BM_BATT_GET, BATT_PRESENT, &v[2]) && battmgr_get(BM_BATT_GET, BATT_VOLT_NOW, &v[3]) &&
++	    battmgr_get(BM_BATT_GET, BATT_CURR_NOW, &v[4]) && battmgr_get(BM_BATT_GET, BATT_TEMP, &v[5]) &&
++	    battmgr_get(BM_USB_GET, USB_ONLINE, &v[6]);
++	if (!ok) {
++		printf("ISHTAR ADSP: battmgr no answer\n");
++		return;
++	}
++	if (v[6]) {
++		(void)battmgr_get(BM_USB_GET, USB_VOLT_NOW, &v[7]);
++		(void)battmgr_get(BM_USB_GET, USB_CURR_NOW, &v[8]);
++		(void)battmgr_get(BM_USB_GET, USB_TYPE, &v[9]);
++	}
++	if (round % 30 == 0) {
++		(void)battmgr_get(BM_BATT_GET, BATT_CHG_FULL, &full);
++		(void)battmgr_get(BM_BATT_GET, BATT_CHG_FULL_DESIGN, &design);
++		(void)battmgr_get(BM_BATT_GET, BATT_CYCLE_COUNT, &cycles);
++	}
++	s.percent = (int)(v[0] + 50) / 100;
++	s.percent = s.percent < 0 ? 0 : s.percent > 100 ? 100 : s.percent;
++	s.status = (int)v[1];
++	s.present = v[2] != 0;
++	s.mv = (int)v[3] / 1000;
++	s.ma = -(int)v[4] / 1000;      /* the gauge: negative while charging (-733 mA, status charging, 5.6 W in) */
++	s.temp_centi = (int)v[5];
++	s.external = v[6] != 0;
++	s.usb_mv = (int)v[7] / 1000;
++	s.usb_ma = (int)v[8] / 1000;
++	s.usb_type = (int)v[9];
++	s.full_mah = (int)full / 1000;
++	s.design_mah = (int)design / 1000;
++	s.cycles = (int)cycles;
++	s.seq = shared.seq + 1;
++	/* ponytail: plain copy, a torn read in IshtarBattery mixes two samples 10 s apart; seqlock if that ever matters */
++	memcpy(__DEVOLATILE(void *, &shared), &s, sizeof(s));
++	if (round < 3 || round % 30 == 0) {
++		printf("ISHTAR ADSP: battery %d%% status %d %d mV %d mA %d.%02d C usb %d (%d mV %d mA type %d) full %d/%d mAh "
++		    "cycles %d\n", s.percent, s.status, s.mv, s.ma, s.temp_centi / 100, s.temp_centi % 100, s.external, s.usb_mv,
++		    s.usb_ma, s.usb_type, s.full_mah, s.design_mah, s.cycles);
++	}
++}
++
++/* IshtarBattery.cpp: the last sample; false until there is one */
++bool
++ishtar_battmgr_read(struct ishtar_battmgr_sample *out)
++{
++	memcpy(out, __DEVOLATILE(const void *, &shared), sizeof(*out));
++	return out->seq != 0;
++}
++
++/* ---- the thread ---- */
++
++static bool handed_over, gave_up;
++
++static void
++service(void)
++{
++	struct smp2p w = { 0 };
++	struct gpacket *p;
++	uint32_t s = dsp_state(&w);
++
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t who = rd(ipcc + IPCC_RECV);
++		if (who == 0xffffffffu || who >> 16 != IPCC_LPASS) {
++			break;
++		}
++		wr(ipcc + IPCC_CLEAR, who);
++	}
++	if (w.magic == SMP2P_MAGIC) {
++		smp2p_listen(&w);
++	}
++	if ((s & DSP_HANDOVER) && !handed_over) {
++		handed_over = true;
++		rails(0);
++	}
++	if ((s & DSP_FATAL) && !gave_up) {
++		gave_up = true;
++		printf("ISHTAR ADSP: DSP FATAL (slave-kernel %#x)\n", s);
++		crash_reason();
++	}
++	gpump();
++	for (unsigned c = 0; c < CHANNELS; c++) {
++		while ((p = g.ch[c].first)) {
++			g.ch[c].first = p->next;
++			g.ch[c].last = g.ch[c].first ? g.ch[c].last : NULL;
++			(c == CH_QRTR ? qrtr_input : battmgr_input)(p->data, p->len);
++			kfree_data(p, sizeof(*p) + p->len);
++		}
++	}
++}
++
++static bool handover;           /* UEFI started the DSP (uefipil.cfg [AUTO] FULL_ADSP): take it over as it is */
++
++static bool
++glink_up(void)
++{
++	uint32_t size = 0;
++	if (!(g.desc = smem_find(ITEM_GLINK_DESC, &size)) && !(g.desc = smem_alloc(ITEM_GLINK_DESC, 32))) {
++		return false;
++	}
++	if (!(g.tx = smem_find(ITEM_GLINK_TX, &g.tx_size)) && (g.tx = smem_alloc(ITEM_GLINK_TX, 16384))) {
++		g.tx_size = 16384;
++	}
++	printf("ISHTAR ADSP: glink marks tx %#x/%#x rx %#x/%#x (tail/head)\n", rd(smem + TX_TAIL), rd(smem + TX_HEAD),
++	    rd(smem + RX_TAIL), rd(smem + RX_HEAD));
++	if (!handover) {                /* ponytail: on a handover UEFI's ring positions are kept as they are */
++		wr(smem + RX_TAIL, 0);
++		wr(smem + TX_HEAD, 0);
++		dsb();
++	}
++	for (unsigned ms = 0; ms < 2000 && !(g.rx = smem_find(ITEM_GLINK_RX, &g.rx_size)); ms += 10) {
++		sleep_ms(10);
++	}
++	printf("ISHTAR ADSP: glink desc %#x tx %#x+%#x rx %#x+%#x\n", g.desc, g.tx, g.tx_size, g.rx, g.rx_size);
++	if (!g.tx || !g.rx || g.tx_size < 1024 || g.rx_size < 1024 || (g.tx_size | g.rx_size) & 7) {
++		return false;
++	}
++	g.up = true;
++	gsay(G_VERSION, 1, G_FEATURES, NULL, 0);
++	return true;
++}
++
++static bool
++adsp_boot(void)
++{
++	struct smp2p w = { 0 };
++	uint32_t cl, size = 0;
++
++	if (!step(2, "smem survey")) {
++		return false;
++	}
++	if (!smem_partition(HOST_APPS, HOST_ADSP, &cl)) {
++		printf("ISHTAR ADSP: no smem partition 0/2\n");
++		return false;
++	}
++	printf("ISHTAR ADSP: smem partition 0/2 found; DSP smp2p item %s, glink desc %s\n",
++	    smem_find(ITEM_SMP2P_DSP, &size) ? "there" : "absent", smem_find(ITEM_GLINK_DESC, &size) ? "there" : "absent");
++	uint32_t up = dsp_state(&w);
++	if (smem_find(ITEM_SMP2P_DSP, &size)) {
++		/* started by UEFI (uefipil.cfg [AUTO] FULL_ADSP): its item as it is, then up to 10 s for "ready" */
++		for (unsigned i = 0; i < w.valid && i < 16; i++) {
++			printf("ISHTAR ADSP: DSP smp2p v%#x %u->%u flags %#x entry %u \"%.16s\" = %#x\n", w.version, w.local,
++			    w.remote, w.flags, i, w.entry[i].name, w.entry[i].value);
++		}
++		uint32_t s2 = 0;
++		our_smp2p = smem_find(ITEM_SMP2P_OURS, &size);
++		printf("ISHTAR ADSP: our smp2p item %s\n", our_smp2p ? "there (UEFI's)" : "absent");
++		for (unsigned ms = 0; ms < 10000 && our_smp2p && !((s2 = dsp_state(&w)) & DSP_READY); ms += 10) {
++			service();
++			sleep_ms(10);
++		}
++		up = s2;
++	}
++	if (smem_find(ITEM_SMP2P_DSP, &size)) {
++		printf("ISHTAR ADSP: DSP already there (slave-kernel %#x): started by UEFI, taking it over\n", up);
++		handover = true;
++		our_smp2p = smem_find(ITEM_SMP2P_OURS, &size);
++		if (!our_smp2p && !smp2p_make()) {
++			return false;
++		}
++		wr(ipcc + IPCC_ENABLE, IPCC_LPASS << 16 | SIG_SMP2P);
++		wr(ipcc + IPCC_ENABLE, IPCC_LPASS << 16 | SIG_GLINK);
++		service();
++		return glink_up();         /* not gated by ishtar-adsp-step: no TZ call on this path */
++	}
++	if (adsp_mode != 2) {
++		printf("ISHTAR ADSP: no DSP started by UEFI (uefipil.cfg [AUTO] FULL_ADSP), and ishtar-adsp=2 not set\n");
++		return false;
++	}
++	if (!step(3, "bandwidth votes, dtb image: init, mem_setup, copy") || !bandwidth(1) || !pas_load("adsp_dtb", PAS_DTB, DTB_PA, DTB_SIZE) ||
++	    !step(4, "our smp2p item") || !smp2p_make() || !step(5, "ipcc enable + AOP load_state")) {
++		return false;
++	}
++	wr(ipcc + IPCC_ENABLE, IPCC_LPASS << 16 | SIG_SMP2P);
++	wr(ipcc + IPCC_ENABLE, IPCC_LPASS << 16 | SIG_GLINK);
++	if (!qmp_send("{class: image, res: load_state, name: adsp, val: on}") || !step(6, "rpmh lcx/lmx 384") ||
++	    !rails(384) || !step(7, "dtb auth_and_reset") || scm(5, 1, PAS_DTB, 0, 0) != 0 ||
++	    !step(8, "adsp image: init, mem_setup, copy") || !pas_load("adsp", PAS_ADSP, ADSP_PA, ADSP_SIZE) ||
++	    !step(9, "adsp auth_and_reset, wait for ready") || scm(5, 1, PAS_ADSP, 0, 0) != 0) {
++		return false;
++	}
++	uint64_t start = now_ms();
++	uint32_t s = 0;
++	while (now_ms() - start < 10000 && !((s = dsp_state(&w)) & (DSP_READY | DSP_FATAL))) {
++		service();              /* smp2p feature agreement, handover */
++		sleep_ms(1);
++	}
++	printf("ISHTAR ADSP: slave-kernel %#x after %llu ms\n", s, now_ms() - start);
++	if (!(s & DSP_READY) || (s & DSP_FATAL)) {
++		crash_reason();
++		return false;
++	}
++	service();
++	return step(10, "glink") && glink_up();
++}
++
++static void
++adsp_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	vnode_t vp = NULLVP;
++
++	thread_set_thread_name(current_thread(), "ishtar.adsp");
++	/* the firmware is on /private/var, which may be mounted well after the root */
++	for (unsigned i = 0; i < 600; i++) {
++		if (rootvnode != NULLVP && vnode_lookup(FW_DIR "adsp.mdt", 0, &vp, vfs_context_kernel()) == 0) {
++			vnode_put(vp);
++			break;
++		}
++		sleep_ms(200);
++	}
++	unsigned delay_s = 10;
++	(void)PE_parse_boot_argn("ishtar-adsp-step", &max_step, sizeof(max_step));
++	(void)PE_parse_boot_argn("ishtar-adsp-delay", &delay_s, sizeof(delay_s));
++	printf("ISHTAR ADSP: firmware %s, starting in %u s (steps up to %u)\n", vp ? "found" : "NOT FOUND", delay_s, max_step);
++	sleep_ms(delay_s * 1000);
++	if (!step(1, "map smem, ipcc, aoss, rsc, cmd-db")) {
++		thread_terminate(current_thread());
++	}
++	/*
++	 * Device memory, never Normal: SMEM holds partitions of other processors that are access-protected, and a Normal
++	 * (write-combining) mapping lets the CPU read them speculatively (Linux qcom_smem maps only the local host's
++	 * partitions for this reason). With the whole 2 MiB mapped write-combining the UI hung a few minutes later.
++	 */
++	smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	ipcc = ml_io_map(IPCC_PA, 0x1000);
++	aoss = ml_io_map(AOSS_PA, 0x400);
++	tcs = ml_io_map(RSC_TCS_PA & ~0xfffu, 0x4000) + (RSC_TCS_PA & 0xfffu);
++	cmddb = ml_io_map(CMD_DB_PA, CMD_DB_SIZE);
++	if (!adsp_boot()) {
++		printf("ISHTAR ADSP: not up\n");
++		thread_terminate(current_thread());
++	}
++	uint64_t last = 0;
++	bool dumped = false;
++	for (unsigned round = 0;;) {
++		service();
++		if (g.broken) {
++			printf("ISHTAR ADSP: link broken, battery stays at its last sample\n");
++			break;
++		}
++		if (g.ch[CH_PMIC].open && now_ms() - last >= 10000) {
++			if (!dumped) {
++				/* the property ids are downstream's; one full dump to check them against the gauge */
++				for (uint32_t p = 0; p < 24; p++) {
++					uint32_t v = 0;
++					bool ok = battmgr_get(BM_BATT_GET, p, &v);
++					printf("ISHTAR ADSP: battmgr batt prop %u = %d%s\n", p, (int)v, ok ? "" : " (no answer)");
++				}
++				for (uint32_t p = 0; p < 12; p++) {
++					uint32_t v = 0;
++					bool ok = battmgr_get(BM_USB_GET, p, &v);
++					printf("ISHTAR ADSP: battmgr usb prop %u = %d%s\n", p, (int)v, ok ? "" : " (no answer)");
++				}
++				dumped = true;
++			}
++			battmgr_poll(round++);
++			last = now_ms();
++		}
++		sleep_ms(20);
++	}
++	thread_terminate(current_thread());
++}
++
++void
++ishtar_adsp_start(void)
++{
++	thread_t t;
++	if (!PE_parse_boot_argn("ishtar-adsp", &adsp_mode, sizeof(adsp_mode)) || adsp_mode < 1 || adsp_mode > 2) {
++		return;
++	}
++	if (kernel_thread_start(adsp_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++		printf("ISHTAR ADSP: started\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_ISHTAR */
+diff --git a/bsd/dev/ishtar_board.h b/bsd/dev/ishtar_board.h
+index 7a4059c..cd7923d 100644
+--- a/bsd/dev/ishtar_board.h
++++ b/bsd/dev/ishtar_board.h
+@@ -76,4 +76,24 @@ ishtar_board_ref(void)
+ 	return cached == 1;
+ }
+ 
++/* bsd/dev/ishtar_adsp.c: the ADSP battery manager's last reading, for iokit/Kernel/arm/IshtarBattery.cpp */
++struct ishtar_battmgr_sample {
++	uint32_t seq;                   /* 0: nothing read yet */
++	int percent;
++	int status;                     /* POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
++	int present, external;
++	int mv, ma;                     /* ma > 0 while the battery charges */
++	int temp_centi;
++	int usb_mv, usb_ma, usb_type;
++	int full_mah, design_mah, cycles;       /* 0 until known */
++};
++#ifdef __cplusplus
++extern "C" {
++#endif
++bool ishtar_battmgr_read(struct ishtar_battmgr_sample *out);
++void ishtar_adsp_start(void);
++#ifdef __cplusplus
++}
++#endif
++
+ #endif /* _ISHTAR_BOARD_H_ */
+diff --git a/iokit/Kernel/arm/IshtarBattery.cpp b/iokit/Kernel/arm/IshtarBattery.cpp
+index 3fbc4ba..987da99 100644
+--- a/iokit/Kernel/arm/IshtarBattery.cpp
++++ b/iokit/Kernel/arm/IshtarBattery.cpp
+@@ -1,8 +1,6 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * ishtarbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery service. The values are the SM8550 ADSP battery manager's (bsd/dev/ishtar_adsp.c, boot-arg
++ * ishtar-adsp=1), read every 10 seconds; until it has answered: 100%, AC, not charging.
+  */
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -13,9 +11,6 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ #include "../../../bsd/dev/ishtar_board.h"
+-/* bsd/dev/ishtar_spmi.c */
+-extern "C" int ishtar_spmi_init(void);
+-extern "C" int ishtar_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ /*
+  * Last published state of charge and charge current (positive = charging), for the framebuffer's on-screen
+@@ -43,18 +38,14 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+-	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void publish(const struct ishtar_battmgr_sample *s);
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
+-	void pollIshtar(void);
+-	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(IshtarBattery, IOPMPowerSource);
+ 
+@@ -69,7 +60,7 @@ IshtarBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -116,24 +107,29 @@ IshtarBattery::putBool(const char *key, bool value)
+ }
+ 
+ void
+-IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++IshtarBattery::publish(const struct ishtar_battmgr_sample *s)
+ {
++	const bool measured = s->seq != 0, external = s->external != 0;
++	const bool charging = external && s->status == 1, full = external && (s->status == 4 || s->percent == 100);
++	const unsigned percent = (unsigned)s->percent, mv = (unsigned)s->mv;
++	const unsigned design = s->design_mah > 0 ? (unsigned)s->design_mah : 5000u;   /* stock: 5000 mAh */
++	const unsigned fullCharge = s->full_mah > 0 ? (unsigned)s->full_mah : design;
++	const int ma = s->ma;
+ 	/*
+ 	 * Patch 0130: iOS' AppleSmartBattery publishes the UI state of charge as
+ 	 * CurrentCapacity (0..100) with MaxCapacity 100; the mAh values live in
+ 	 * AppleRaw*Capacity / NominalChargeCapacity. Consumers that read
+ 	 * CurrentCapacity as a percentage (BatteryCenter, SpringBoard's status bar
+-	 * item, powerd's "Current Capacity") saw 5020 here. DT nominal = 5020 mAh.
++	 * item, powerd's "Current Capacity") saw the mAh value here.
+ 	 */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const unsigned capacity = (fullCharge * percent + 50u) / 100u;
+ 	ishtar_batt_ma = ma;
+ 	ishtar_batt_percent = (int)percent;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(percent);
+ 	setMaxCapacity(100);
+ 	setExternalConnected(external);
+-	setExternalChargeCapable(capable);
++	setExternalChargeCapable(external);
+ 	setIsCharging(charging);
+ 	setAtWarnLevel(false);
+ 	/* An uncalibrated voltage curve must not assert a critical shutdown. */
+@@ -141,11 +137,11 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(0xffff); /* Unknown (AppleSmartBattery's 65535); never zero minutes. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount((unsigned)s->cycles);
+ 	putBool("FullyCharged", full);
+ 	putBool("built-in", true);
+ 	putBool("CapacityEstimated", !measured);
+-	putNumber("NominalChargeCapacity", 5020);
++	putNumber("NominalChargeCapacity", fullCharge);
+ 	putNumber("AppleRawBatteryVoltage", mv);
+ 	putNumber("DesignCycleCount9C", 500);
+ 	putNumber("PermanentFailureStatus", 0);
+@@ -160,8 +156,8 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		OSDictionary *bd = OSDictionary::withCapacity(8);
+ 		if (bdKey && bd) {
+ 			struct { const char *k; UInt32 v; } items[] = {
+-				{"CycleCount", 0}, {"DesignCapacity", 5020}, {"StateOfCharge", percent},
+-				{"Voltage", mv}, {"MaxCapacity", 5020}, {"NominalChargeCapacity", 5020},
++				{"CycleCount", (UInt32)s->cycles}, {"DesignCapacity", design}, {"StateOfCharge", percent},
++				{"Voltage", mv}, {"MaxCapacity", fullCharge}, {"NominalChargeCapacity", fullCharge},
+ 				{"Flags", 0}, {"ResScale", 1},
+ 			};
+ 			for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+@@ -184,7 +180,9 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 				OSDictionary *ad = OSDictionary::withCapacity(6);
+ 				if (ad) {
+ 					struct { const char *k; UInt32 v; } items[] = {
+-						{"AdapterVoltage", 5000}, {"Current", 500}, {"Watts", 3},
++						{"AdapterVoltage", s->usb_mv > 0 ? (UInt32)s->usb_mv : 5000},
++						{"Current", s->usb_ma > 0 ? (UInt32)s->usb_ma : 500},
++						{"Watts", s->usb_mv > 0 && s->usb_ma > 0 ? (UInt32)((s->usb_mv * s->usb_ma + 500000) / 1000000) : 3},
+ 						{"Source", 0}, {"IsWireless", 0}, {"FamilyCode", 0xe0004001u},
+ 					};
+ 					for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+@@ -214,15 +212,15 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	}
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fullCharge);
++	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C, as the gauge gives it; 25 C until it answered. */
++	putNumber("Temperature", measured ? (UInt32)s->temp_centi : 2500);
+ 	putBool("IshtarBatteryHardwareSampleValid", measured);
+-	putBool("IshtarBatteryCurrentValid", currentValid);
+-	putBool("IshtarBatterySOCEstimated", measured);
+-	putBool("IshtarBatteryTemperatureEstimated", true);
++	putBool("IshtarBatteryCurrentValid", measured);
++	putBool("IshtarBatterySOCEstimated", false);
++	putBool("IshtarBatteryTemperatureEstimated", !measured);
+ 	putBool("IshtarBatteryFallback", !measured);
+ 	putNumber("IshtarBatteryPercent", percent);
+ 
+@@ -232,7 +230,7 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fullCharge, mv, (UInt32)ma, (UInt32)s->cycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -249,146 +247,19 @@ IshtarBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("ISHTAR BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? (ishtar_board_ref() ? "PMI8998 FG SOC" : "PM6150 / estimated SOC") : "static fallback",
+-		    percent, mv, external, charging);
++		    measured ? "ADSP battery manager" : "static fallback", percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
+-/* Keep the proven single-byte observer command. Read two matching whole
+- * words to reject most torn ADC samples without writing the QG HOLD bit.
+- * This is a bounded consistency check, not a hardware snapshot guarantee. */
+-bool
+-IshtarBattery::readWord(unsigned address, uint16_t *value, unsigned sid)
+-{
+-	uint16_t previous = 0;
+-	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+-		uint8_t lo, hi;
+-		if (ishtar_spmi_read(sid, address, &lo) ||
+-		    ishtar_spmi_read(sid, address + 1, &hi)) {
+-			return false;
+-		}
+-		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+-		if (attempt && next == previous) {
+-			*value = next;
+-			return true;
+-		}
+-		previous = next;
+-	}
+-	return false;
+-}
+-
+-unsigned
+-IshtarBattery::estimatePercent(unsigned mv)
+-{
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+-	if (mv <= volts[0]) {
+-		return soc[0];
+-	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
+-		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
+-		}
+-	}
+-	return 100;
+-}
+-
+-/*
+- * Ishtar: PMI8998 (SID 2) FG gen3 + SMB2 charger, read-only, as Linux
+- * qpnp-fg-gen3.c / smb-reg.h. The FG keeps its own calibrated monotonic
+- * SOC (0x4009, 0..255), so no voltage estimate is needed here.
+- */
+-void
+-IshtarBattery::pollIshtar(void)
+-{
+-	const unsigned sid = 2;
+-	uint8_t msoc = 0, msoc2 = 1, usb = 0, charger = 0;
+-	uint16_t rawVoltage = 0, rawCurrent = 0;
+-	bool valid = fReal;
+-	/* two equal reads of the monotonic SOC, like fg_get_msoc_raw */
+-	for (unsigned i = 0; valid && i < 5; ++i) {
+-		valid = !ishtar_spmi_read(sid, 0x4009, &msoc) && !ishtar_spmi_read(sid, 0x4009, &msoc2);
+-		if (msoc == msoc2) {
+-			break;
+-		}
+-	}
+-	valid = valid && msoc == msoc2 &&
+-	    readWord(0x41a0, &rawVoltage, sid) &&
+-	    !ishtar_spmi_read(sid, 0x1310, &usb) &&
+-	    !ishtar_spmi_read(sid, 0x1006, &charger);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
+-	valid = valid && mv >= 2800 && mv <= 4600;
+-	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
+-	}
+-	/* qpnp-fg-gen3.c fg_get_msoc: DIV_ROUND_CLOSEST((msoc - 1) * 98, 253) + 1 */
+-	unsigned percent = msoc == 255 ? 100 : msoc == 0 ? 0 :
+-	    ((unsigned)(msoc - 1) * 98u + 126u) / 253u + 1u;
+-	bool external = (usb & 0x10u) != 0;          /* USBIN_PLUGIN_RT_STS */
+-	unsigned state = charger & 7u;
+-	bool charging = external && state >= 1 && state <= 4;
+-	bool full = external && state == 5;          /* TERMINATE_CHARGE */
+-	int ma = 0;
+-	bool currentValid = readWord(0x41a2, &rawCurrent, sid);
+-	if (currentValid) {
+-		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* FG: positive = discharging, 488.281 uA/bit; IOPMPowerSource: positive = charging, mA */
+-		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
+-	}
+-	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
+-}
+-
+ void
+ IshtarBattery::poll(void)
+ {
+-	if (fReal && ishtar_board_ref()) {
+-		pollIshtar();
+-		return;
++	struct ishtar_battmgr_sample s;
++	if (!ishtar_battmgr_read(&s)) {
++		s = (struct ishtar_battmgr_sample){ .percent = 100, .status = 4, .present = 1, .external = 1, .mv = 4200 };
+ 	}
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
+-	bool valid = fReal &&
+-	    !ishtar_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !ishtar_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !ishtar_spmi_read(0, 0x1310, &usb) &&
+-	    !ishtar_spmi_read(0, 0x110b, &path) &&
+-	    !ishtar_spmi_read(0, 0x1006, &charger) &&
+-	    !ishtar_spmi_read(0, 0x1007, &error) &&
+-	    !ishtar_spmi_read(0, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+-	valid = valid && mv >= 2800 && mv <= 4600;
+-	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
+-	}
+-	bool external = (usb & 0x10u) != 0;
+-	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+-	unsigned state = charger & 7u;
+-	bool charging = capable && state >= 1 && state <= 4 &&
+-	    !(error & 2u) && !(temperature & 0x0cu);
+-	/* Inhibit (0) does not by itself establish full capacity. */
+-	bool full = external && state == 5 && !(error & 2u);
+-	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !ishtar_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
+-	if (currentValid) {
+-		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+-		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+-	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	publish(&s);
+ }
+ 
+ void
+@@ -397,7 +268,7 @@ IshtarBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IshtarBattery *self = OSDynamicCast(IshtarBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(10000);
+ 	}
+ }
+ 
+@@ -407,23 +278,17 @@ IshtarBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
+-	(void)PE_parse_boot_argn("ishtarbattery", &real, sizeof(real));
+-	fReal = real == 1 && ishtar_spmi_init() == 0;
++	ishtar_adsp_start();
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
+-		fLoop = IOWorkLoop::workLoop();
+-		fTimer = IOTimerEventSource::timerEventSource(this, &IshtarBattery::timerFired);
+-		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+-			fTimerAdded = true;
+-			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
+-		} else {
+-			fReal = false;
+-			poll();
+-			IOLog("ISHTAR BATTERY: timer unavailable; static fallback\n");
+-		}
++	fLoop = IOWorkLoop::workLoop();
++	fTimer = IOTimerEventSource::timerEventSource(this, &IshtarBattery::timerFired);
++	if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++		fTimerAdded = true;
++		fRunning = true;
++		fTimer->setTimeoutMS(10000);
++	} else {
++		IOLog("ISHTAR BATTERY: timer unavailable; static fallback\n");
+ 	}
+ 	registerService();
+ 	return true;
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index a97ed0f..772b83f 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -77,6 +77,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IshtarHIDTouch;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IshtarBattery;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IshtarBattery;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

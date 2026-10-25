@@ -1,0 +1,345 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 396da26..042725c 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1190,6 +1190,323 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * ishtar (SM8550) touch bring-up probe, boot-arg ishtartouchprobe=1: READ ONLY. ST FTS on SPI = QUP wrap2 SE0
++ * (0x880000), avdd = PM8008i L7 on the I2C hub SE2 (0x988000), reset GPIO 117, IRQ 118 (67 on new units),
++ * PM8008 enable GPIO 87. GCC offsets from Linux v6.12 gcc-sm8550.c; an engine is only read when its clocks run.
++ */
++/* Polled GENI I2C (FIFO mode), engine first set up here: 100 kHz from the 19.2 MHz source (Linux i2c-qcom-geni table). */
++static void
++geni_w(vm_offset_t se, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++geni_wait(vm_offset_t se, uint32_t want)
++{
++	uint32_t st = 0;
++	for (int i = 0; i < 20000; i++) {             /* 20 ms */
++		st = *(volatile uint32_t *)(se + 0x610);  /* M_IRQ_STATUS */
++		if (st & (want | 0x7e0eu)) {              /* + errors: overrun, illegal, failure, GP (NACK, bus) */
++			break;
++		}
++		delay(1);
++	}
++	geni_w(se, 0x618, st);
++	return st;
++}
++
++/* One byte from a 16-bit register of I2C device addr. Returns the byte, or -1 with the M_IRQ status printed. */
++static int
++geni_i2c_read16(vm_offset_t se, uint8_t addr, uint16_t reg)
++{
++	geni_w(se, 0x26c, 2);                                           /* TX_LEN */
++	geni_w(se, 0x600, (1u << 27) | ((uint32_t)addr << 9) | (1u << 2));  /* WRITE, hold stop */
++	geni_w(se, 0x80c, 1);                                           /* TX watermark: ask for the data */
++	uint32_t st = geni_wait(se, 1u << 30);                         /* TX watermark */
++	if (!(st & (1u << 30)) || (st & 0x7e0eu)) {
++		printf("ISHTAR TOUCHPROBE: i2c %#x reg %#x: write phase %#x\n", addr, reg, st);
++		return -1;
++	}
++	geni_w(se, 0x700, (uint32_t)(reg >> 8) | ((uint32_t)(reg & 0xff) << 8));   /* big-endian register address */
++	geni_w(se, 0x80c, 0);
++	st = geni_wait(se, 1u);
++	if (!(st & 1u) || (st & 0x7e0eu)) {
++		printf("ISHTAR TOUCHPROBE: i2c %#x reg %#x: write done %#x\n", addr, reg, st);
++		return -1;
++	}
++	geni_w(se, 0x270, 1);                                           /* RX_LEN */
++	geni_w(se, 0x600, (2u << 27) | ((uint32_t)addr << 9));          /* READ */
++	st = geni_wait(se, 1u);
++	if (!(st & 1u) || (st & 0x7e0eu) || !(*(volatile uint32_t *)(se + 0x804) & 0x1ffffffu)) {
++		printf("ISHTAR TOUCHPROBE: i2c %#x reg %#x: read %#x\n", addr, reg, st);
++		return -1;
++	}
++	return (int)(*(volatile uint32_t *)(se + 0x780) & 0xff);
++}
++
++/* One byte to a 16-bit register of I2C device addr. Returns 0, or -1 with the M_IRQ status printed. */
++static int
++geni_i2c_write16(vm_offset_t se, uint8_t addr, uint16_t reg, uint8_t val)
++{
++	geni_w(se, 0x26c, 3);
++	geni_w(se, 0x600, (1u << 27) | ((uint32_t)addr << 9));
++	geni_w(se, 0x80c, 1);
++	uint32_t st = geni_wait(se, 1u << 30);
++	if (!(st & (1u << 30)) || (st & 0x7e0eu)) {
++		printf("ISHTAR TOUCHPROBE: i2c %#x reg %#x write: phase %#x\n", addr, reg, st);
++		return -1;
++	}
++	geni_w(se, 0x700, (uint32_t)(reg >> 8) | ((uint32_t)(reg & 0xff) << 8) | ((uint32_t)val << 16));
++	geni_w(se, 0x80c, 0);
++	st = geni_wait(se, 1u);
++	if (!(st & 1u) || (st & 0x7e0eu)) {
++		printf("ISHTAR TOUCHPROBE: i2c %#x reg %#x write: done %#x\n", addr, reg, st);
++		return -1;
++	}
++	return 0;
++}
++
++/* Stage 3: PM8008i out of reset (GPIO 87 high, stock pm8008i_active) and its REVID TYPE/SUBTYPE read. Reads only. */
++static void
++ishtar_touch_pm8008_probe(vm_offset_t se, vm_offset_t tlmm, int stage)
++{
++	geni_w(se, 0x20, 1);            /* GENI_FORCE_DEFAULT_REG */
++	geni_w(se, 0x24, 0x7f);         /* GENI_OUTPUT_CTRL */
++	geni_w(se, 0x28, *(volatile uint32_t *)(se + 0x28) | 0x7f);   /* GENI_CGC_CTRL */
++	geni_w(se, 0x7c, 0);            /* CLK_SEL */
++	geni_w(se, 0x48, (7u << 4) | 1u);                   /* M_CLK_CFG: div 7, enable */
++	geni_w(se, 0x278, (10u << 20) | (11u << 10) | 26u);  /* SCL high/low/cycle */
++	geni_w(se, 0x258, 0);           /* FIFO mode */
++	geni_w(se, 0x260, 0x7f8fe); geni_w(se, 0x264, 0xffefe);
++	geni_w(se, 0x284, 0x7f8fe); geni_w(se, 0x288, 0xffefe);
++	geni_w(se, 0x254, 0);
++	geni_w(se, 0x80c, 0);
++	geni_w(se, 0x618, 0xffffffffu);
++	geni_w(se, 0x614, 0x40007e3fu);  /* M_IRQ_EN: done, errors, cancel, abort, TX watermark (polled; SE_IRQ_EN untouched) */
++	vm_offset_t g87 = tlmm + 87 * 0x1000u;
++	geni_w(g87, 4, 2);              /* output value high first */
++	geni_w(g87, 0, 0x200);          /* gpio, 2 mA, no pull, OE */
++	delay(10000);
++	printf("ISHTAR TOUCHPROBE: gpio87 now ctl %#x io %#x\n", *(volatile uint32_t *)g87, *(volatile uint32_t *)(g87 + 4));
++	for (uint8_t addr = 8; addr <= 9; addr++) {
++		int type = geni_i2c_read16(se, addr, 0x104), sub = geni_i2c_read16(se, addr, 0x105);
++		printf("ISHTAR TOUCHPROBE: pm8008 i2c %#x revid type %d subtype %d (expect 81 / 44)\n", addr, type, sub);
++	}
++	/*
++	 * Stage 4: touch avdd on. PM8008 chip enable 0x946 bit 7 (addr 0x8, downstream pm8008-chip@900), then L7 (addr 0x9,
++	 * base 0x4600; Linux qcom-pm8008-regulator.c): VSET 0x40/0x41 = mV little-endian, 3300 = stock init-voltage,
++	 * EN_CTL 0x46 bit 7. STATUS1 0x08 bit 7 = VREG_READY.
++	 */
++	if (stage < 4) {
++		return;
++	}
++	printf("ISHTAR TOUCHPROBE: stage 4: chip-en %#x l7 status %#x vset %#x/%#x en %#x\n", geni_i2c_read16(se, 8, 0x946),
++	    geni_i2c_read16(se, 9, 0x4608), geni_i2c_read16(se, 9, 0x4640), geni_i2c_read16(se, 9, 0x4641),
++	    geni_i2c_read16(se, 9, 0x4646));
++	int en = geni_i2c_read16(se, 8, 0x946);
++	if (en < 0 || geni_i2c_write16(se, 8, 0x946, (uint8_t)(en | 0x80)) ||
++	    geni_i2c_write16(se, 9, 0x4640, 3300 & 0xff) || geni_i2c_write16(se, 9, 0x4641, 3300 >> 8) ||
++	    geni_i2c_write16(se, 9, 0x4646, 0x80)) {
++		printf("ISHTAR TOUCHPROBE: stage 4: a PM8008 write failed\n");
++		return;
++	}
++	delay(5000);
++	printf("ISHTAR TOUCHPROBE: stage 4: chip-en %#x l7 status %#x vset %#x/%#x en %#x (expect status bit 7)\n",
++	    geni_i2c_read16(se, 8, 0x946), geni_i2c_read16(se, 9, 0x4608), geni_i2c_read16(se, 9, 0x4640),
++	    geni_i2c_read16(se, 9, 0x4641), geni_i2c_read16(se, 9, 0x4646));
++}
++
++/* Full-duplex GENI SPI (opcode 7, FIFO, CS held for the command), n <= 32 bytes; rx may alias nothing. */
++static int
++geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
++{
++	geni_w(se, 0x26c, n);                   /* SE_SPI_TX_TRANS_LEN */
++	geni_w(se, 0x270, n);                   /* SE_SPI_RX_TRANS_LEN */
++	geni_w(se, 0x600, 7u << 27);            /* SPI_TX_RX */
++	geni_w(se, 0x80c, 1);
++	uint32_t st = geni_wait(se, 1u << 30);
++	if (!(st & (1u << 30)) || (st & 0xeu)) {
++		printf("ISHTAR TOUCHPROBE: spi tx wait %#x\n", st);
++		return -1;
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t b = 0; b < 4 && i + b < n; b++) {
++			w |= (uint32_t)tx[i + b] << (8 * b);
++		}
++		geni_w(se, 0x700, w);
++	}
++	geni_w(se, 0x80c, 0);
++	st = geni_wait(se, 1u);
++	if (!(st & 1u) || (st & 0xeu)) {
++		printf("ISHTAR TOUCHPROBE: spi done %#x geni-status %#x txfifo %#x rxfifo %#x\n", st,
++		    *(volatile uint32_t *)(se + 0x40), *(volatile uint32_t *)(se + 0x800), *(volatile uint32_t *)(se + 0x804));
++		geni_w(se, 0x604, 1u << 2);     /* M_CMD_CTRL cancel */
++		(void)geni_wait(se, 1u << 4);
++		return -1;
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		if (!(*(volatile uint32_t *)(se + 0x804) & 0x1ffffffu)) {
++			printf("ISHTAR TOUCHPROBE: spi rx short at %u\n", i);
++			return -1;
++		}
++		uint32_t w = *(volatile uint32_t *)(se + 0x780);
++		for (uint32_t b = 0; b < 4 && i + b < n; b++) {
++			rx[i + b] = (uint8_t)(w >> (8 * b));
++		}
++	}
++	return 0;
++}
++
++/*
++ * Stage 5: ST FTM5 over SPI (Xiaomi fts_spi driver, LineageOS sm8550 kernel): SE8 as SPI master (mode 0, 8 bit,
++ * CS0, <= 12 MHz from DFS level 0), reset GPIO 117 pulse, then the chip ID (HW register read 0xFB + 0x20000000,
++ * one dummy byte; expect 0x36 0x48/0x50/0x40/0x39) and one FIFO event (0x87, one dummy byte). Reads only on the IC.
++ */
++static void
++ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm)
++{
++	vm_offset_t se = ml_io_map(0x00880000u, 0x4000);
++	uint32_t cfg = *(volatile uint32_t *)(gcc + 0x1e010 + 0x1c), m = *(volatile uint32_t *)(gcc + 0x1e010 + 0x5c),
++	    nreg = *(volatile uint32_t *)(gcc + 0x1e010 + 0x9c);
++	uint32_t src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++	uint64_t hz = src == 0 ? 19200000ull : src == 1 ? 600000000ull : src == 6 ? 300000000ull : 0;
++	if (hid) {
++		hz = hz * 2 / (hid + 1);
++	}
++	if (mode) {
++		uint32_t mm = m & 0xffff, nn = ((~nreg) & 0xffff) + mm;
++		hz = nn ? hz * mm / nn : 0;
++	}
++	uint32_t div = hz ? (uint32_t)((hz + 11999999) / 12000000) : 0;
++	printf("ISHTAR TOUCHPROBE: stage 5: SE8 dfs0 cfg %#x m %#x n %#x = %llu Hz, div %u\n", cfg, m, nreg, hz, div);
++	if (!se || div == 0 || div > 0xfff) {
++		return;
++	}
++	geni_w(se, 0x20, 1);
++	geni_w(se, 0x24, 0x7f);
++	geni_w(se, 0x28, *(volatile uint32_t *)(se + 0x28) | 0x7f);
++	geni_w(se, 0x7c, 0);                    /* CLK_SEL: DFS level 0 */
++	geni_w(se, 0x48, (div << 4) | 1u);
++	geni_w(se, 0x224, 0);                   /* CPHA */
++	geni_w(se, 0x22c, 0);                   /* LOOPBACK */
++	geni_w(se, 0x230, 0);                   /* CPOL */
++	geni_w(se, 0x24c, 0);                   /* DEMUX_OUTPUT_INV */
++	geni_w(se, 0x250, 0);                   /* DEMUX_SEL: CS0 */
++	geni_w(se, 0x25c, 0);                   /* TRANS_CFG: CS held for the whole command */
++	geni_w(se, 0x268, 8 - 4);               /* WORD_LEN */
++	geni_w(se, 0x258, 0);
++	geni_w(se, 0x260, 0x7f8fe); geni_w(se, 0x264, 0xffefe);
++	geni_w(se, 0x284, 0x7f8fe); geni_w(se, 0x288, 0xffefe);
++	/* geni_se_init(se, 0, tx_depth - 2) as Linux spi-geni: RX watermark 0, RX ready-for-receive at TX depth - 2 */
++	uint32_t txd = (*(volatile uint32_t *)(se + 0xe24) >> 16) & 0x3f, rxd = (*(volatile uint32_t *)(se + 0xe2c) >> 16) & 0x3f;
++	geni_w(se, 0x810, 0);
++	geni_w(se, 0x814, txd > 2 ? txd - 2 : 1);
++	printf("ISHTAR TOUCHPROBE: SE8 fifo depth tx %u rx %u ifdis %#x hw0 %#x hw1 %#x hw2 %#x dmacfg %#x\n", txd, rxd,
++	    *(volatile uint32_t *)(se + 0x64), *(volatile uint32_t *)(se + 0xe24), *(volatile uint32_t *)(se + 0xe28),
++	    *(volatile uint32_t *)(se + 0xe2c), *(volatile uint32_t *)(se + 0xe30));
++	if (*(volatile uint32_t *)(se + 0x64) & 1u) {
++		printf("ISHTAR TOUCHPROBE: SE8 FIFO interface disabled (GSI-only engine): FIFO transfers skipped\n");
++		return;
++	}
++	geni_w(se, 0x80c, 0);
++	geni_w(se, 0x618, 0xffffffffu);
++	geni_w(se, 0x614, 0x40007e3fu);
++	vm_offset_t rst = tlmm + 117 * 0x1000u;
++	geni_w(rst, 4, 0);
++	geni_w(rst, 0, 0x200);                  /* reset low, output */
++	delay(10000);
++	geni_w(rst, 4, 2);                      /* release */
++	delay(200000);
++	static const uint8_t id_tx[8] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };
++	uint8_t rx[16] = { 0 };
++	int rc = geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
++	printf("ISHTAR TOUCHPROBE: fts chip id rc %d: %02x %02x %02x (dummy, id0, id1; expect 36 4x/5x/39)\n", rc,
++	    rx[5], rx[6], rx[7]);
++	static const uint8_t ev_tx[10] = { 0x87 };
++	rc = geni_spi_xfer(se, ev_tx, rx, sizeof(ev_tx));
++	printf("ISHTAR TOUCHPROBE: fts event rc %d: %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", rc, rx[1], rx[2],
++	    rx[3], rx[4], rx[5], rx[6], rx[7], rx[8], rx[9]);
++}
++
++static void
++ishtar_touch_probe(int stage)
++{
++	static const struct { const char *name; uint32_t off; } cbcr[] = {
++		{ "w2-core2x", 0x23004 }, { "w2-core", 0x233d4 }, { "w2-mahb", 0x233cc }, { "w2-sahb", 0x233d0 },
++		{ "w2-s0", 0x1e004 }, { "hub-core", 0x23144 }, { "hub-sahb", 0x23140 }, { "hub-s2", 0x1703c },
++	};
++	static const unsigned gpios[] = { 117, 118, 67, 87, 0, 1, 107, 109, 20, 21 };
++	vm_offset_t gcc = ml_io_map(0x00100000u, 0x60000);
++	if (!gcc) {
++		return;
++	}
++	vm_offset_t tlmm = ml_io_map(0x0f100000u, 0x100000);
++	if (stage >= 2 && tlmm) {
++		/*
++		 * Stage 2 (ishtartouchstage=2): vote wrap2 core/core2x/m-ahb/s-ahb/s0 (0x52010 bits 0-4) and the I2C hub
++		 * core/s-ahb/s2 (0x52008 bits 8, 7, 12), then route the pins as the stock DT: SPI gpio0/1/109/107 = qup2_se0
++		 * l0-l3 (mux 2, 6 mA, pull-down), I2C hub gpio20/21 = i2chub0_se2 (mux 1, 2 mA, pull-up). Touch reset and
++		 * PM8008 stay off.
++		 */
++		static const struct { unsigned gpio; uint32_t ctl; } pins[] = {
++			{ 0, 0x89 }, { 1, 0x89 }, { 109, 0x89 }, { 107, 0x89 }, { 20, 0x07 }, { 21, 0x07 },
++		};
++		*(volatile uint32_t *)(gcc + 0x52010) |= 0x1fu;
++		*(volatile uint32_t *)(gcc + 0x52008) |= (1u << 7) | (1u << 8) | (1u << 12);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(1000);
++		for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++			*(volatile uint32_t *)(tlmm + pins[i].gpio * 0x1000u) = pins[i].ctl;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("ISHTAR TOUCHPROBE: stage 2: clocks voted, SPI + I2C hub pins routed\n");
++	}
++	uint32_t on = 0;
++	printf("ISHTAR TOUCHPROBE: votes 52008=%#x 52010=%#x\n",
++	    *(volatile uint32_t *)(gcc + 0x52008), *(volatile uint32_t *)(gcc + 0x52010));
++	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); i++) {
++		uint32_t v = *(volatile uint32_t *)(gcc + cbcr[i].off);
++		on |= ((v & 0x80000000u) && !(v & 2u)) ? 0 : (1u << i);   /* bit 1 HW_CTL: gated, runs on access */
++		printf("ISHTAR TOUCHPROBE: clk %s %#x %s\n", cbcr[i].name, v, (v & 0x80000000u) ? "OFF" : "on");
++	}
++	/* GENI_FW_REVISION_RO 0x68 (protocol 15:8: 1 SPI, 3 I2C), GENI_STATUS 0x40, SE_GENI_IOS 0x908 */
++	if ((on & 0x1fu) == 0x1fu) {
++		vm_offset_t se = ml_io_map(0x00880000u, 0x4000);
++		printf("ISHTAR TOUCHPROBE: SE8 fw %#x status %#x ios %#x\n", *(volatile uint32_t *)(se + 0x68),
++		    *(volatile uint32_t *)(se + 0x40), *(volatile uint32_t *)(se + 0x908));
++	} else {
++		printf("ISHTAR TOUCHPROBE: SE8 clocks not all on, engine not read\n");
++	}
++	if ((on & 0xe0u) == 0xe0u) {
++		vm_offset_t se = ml_io_map(0x00988000u, 0x4000);
++		uint32_t fw = *(volatile uint32_t *)(se + 0x68);
++		printf("ISHTAR TOUCHPROBE: hub SE2 fw %#x status %#x ios %#x clkcfg %#x scl %#x ifdis %#x\n", fw,
++		    *(volatile uint32_t *)(se + 0x40), *(volatile uint32_t *)(se + 0x908), *(volatile uint32_t *)(se + 0x48),
++		    *(volatile uint32_t *)(se + 0x278), *(volatile uint32_t *)(se + 0x64));
++		if (stage >= 3 && ((fw >> 8) & 0xff) == 3 && tlmm) {
++			ishtar_touch_pm8008_probe(se, tlmm, stage);
++		}
++	} else {
++		printf("ISHTAR TOUCHPROBE: hub SE2 clocks not all on, engine not read\n");
++	}
++	if (stage >= 5 && (on & 0x1fu) == 0x1fu && tlmm) {
++		ishtar_touch_fts_probe(gcc, tlmm);
++	}
++	/* SE clock sources: CMD_RCGR, CFG_RCGR, DFSR (bit 0 DFS on, 4:1 level) */
++	printf("ISHTAR TOUCHPROBE: rcg s0 %#x/%#x/%#x hub-s2 %#x/%#x/%#x\n",
++	    *(volatile uint32_t *)(gcc + 0x1e010), *(volatile uint32_t *)(gcc + 0x1e014), *(volatile uint32_t *)(gcc + 0x1e024),
++	    *(volatile uint32_t *)(gcc + 0x17040), *(volatile uint32_t *)(gcc + 0x17044), *(volatile uint32_t *)(gcc + 0x17054));
++	for (unsigned i = 0; tlmm && i < sizeof(gpios) / sizeof(gpios[0]); i++) {
++		vm_offset_t g = tlmm + gpios[i] * 0x1000u;
++		printf("ISHTAR TOUCHPROBE: gpio%u ctl %#x io %#x\n", gpios[i], *(volatile uint32_t *)g,
++		    *(volatile uint32_t *)(g + 4));
++	}
++}
++
+ void
+ ishtar_touch_init(void)
+ {
+@@ -1199,6 +1516,16 @@ ishtar_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++	int probe = 0;
++	if (PE_parse_boot_argn("ishtartouchprobe", &probe, sizeof(probe)) && probe) {
++		int stage = 1;
++		(void)PE_parse_boot_argn("ishtartouchstage", &stage, sizeof(stage));
++		ishtar_touch_probe(stage);
++		if (probe > 1 && probe <= 120) {
++			printf("ISHTAR TOUCHPROBE: holding %d s for the camera\n", probe);
++			delay(probe * 1000000);     /* ishtartouchprobe=N > 1: N seconds to read the lines above */
++		}
++	}
+ 	if (ishtar_board_ref()) {
+ 		tb = &touch_ishtar2;
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */

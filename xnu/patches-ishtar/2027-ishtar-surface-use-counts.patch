@@ -1,0 +1,90 @@
+diff --git a/iokit/Kernel/arm/IshtarSurface.cpp b/iokit/Kernel/arm/IshtarSurface.cpp
+index 6bc642c..657ab2c 100644
+--- a/iokit/Kernel/arm/IshtarSurface.cpp
++++ b/iokit/Kernel/arm/IshtarSurface.cpp
+@@ -296,7 +296,7 @@ ishtar_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW, ui
+ 		return false;
+ 	}
+ 	bzero(until, pages * sizeof(uint64_t));
+-	uint32_t wc = 0;
++	uint32_t wc = 1;        /* write-combined: cached CPU lines of a swap buffer were written back over GPU frames (dashed needle) */
+ 	PE_parse_boot_argn("ishtarfb_lowwc", &wc, sizeof(wc));
+ 	clock_interval_to_absolutetime_interval(ISHTAR_LOWPOOL_COOL_MS, 1000 * 1000, &ishtar_lowpool.cool);
+ 	ishtar_lowpool.cache = wc ? kIOMapWriteCombineCache : kIOMapCopybackCache;
+@@ -851,7 +851,8 @@ public:
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1181,6 +1182,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
++			ishtar_dma_sync_va(mem->getBytesNoCopy(), s->allocSize);       /* as the pool: no dirty zeros to evict over a frame */
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!ishtar_surface_publish(s)) {
+@@ -1664,13 +1666,44 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ }
+ 
+-IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++/*
++ * IOSurfaceIncrement/DecrementUseCount: backboardd counts the app surfaces it composes from, and the app's backing store
++ * draws only into a buffer IOSurfaceIsInUse (the u64 at +0x18 of the state page, also the display's hold) calls free. As a
++ * no-op the count stayed 0: the Clock app redrew digits into the buffer being composed (torn and old digits).
++ * ponytail: no per-client bookkeeping; a process that dies holding counts leaves its surfaces "in use" until they are freed.
++ */
++static IshtarSurface *ishtar_surface_held(IOLock *lock, OSArray *refs, uint32_t id);
++
++static IOReturn
++ishtar_surface_use(IOLock *lock, OSArray *refs, void *id, bool up)
+ {
++	IshtarSurface *s = ishtar_surface_held(lock, refs, (uint32_t)(uintptr_t)id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	volatile SInt64 *count = (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + 0x18);
++	if (up) {
++		OSAddAtomic64(1, count);
++	} else {
++		for (SInt64 c = *count; c > 0 && !OSCompareAndSwap64((UInt64)c, (UInt64)(c - 1), (volatile UInt64 *)count); c = *count) {
++		}
++	}
++	s->release();
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, __unused void *category, void *, void *, void *, void *)
++{
++	return ishtar_surface_use(fLock, fRefs, id, true);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, __unused void *category, void *, void *, void *, void *)
++{
++	return ishtar_surface_use(fLock, fRefs, id, false);
++}
++
+ static IOReturn
+ ishtar_surface_seed_out(IshtarSurface *s, void *seedOut, bool bump)
+ {
+@@ -1792,8 +1825,8 @@ IOSurfaceRootUserClient::dropView(uint32_t id, bool detachedFirst)
+ }
+ 
+ static IOExternalTrap ishtar_surface_traps[] = {
+-	[kIshtarSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kIshtarSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kIshtarSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kIshtarSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kIshtarSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kIshtarSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	/* 4 only detaches (see trapDetach); 5 releases. */

@@ -1,0 +1,132 @@
+name: ishtar kernel (xnu-11215)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: make -k (report every compile error in one run)
+        default: "true"
+      clean:
+        description: full build (ignore the incremental cache)
+        default: "false"
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches-ishtar/**"
+      - "scripts/sync-base.py"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # blacktop/darwin-xnu-build (MIT) fetches xnu for MACOS_VERSION and applies patches/<major>.0/*.sh then *.patch.
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: "15.3"          # xnu-11215.81.4
+  MACHINE_CONFIG: ISHTAR
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch base port (renamed to ishtar)
+        run: python3 scripts/sync-base.py
+
+      - name: Prepare build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # Ours after dxb's own 15.0 fixes (name order): base port, then the board patches (2000+).
+          for f in xnu/base/*.patch xnu/base/*.sh xnu/patches-ishtar/*.patch; do
+            cp "$f" "dxb/patches/15.0/ishtar-$(basename "$f")"
+          done
+          # The ISHTAR kernel is plain arm64; libfirehose_kernel is otherwise built arm64e-only.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -q 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # Incremental builds: right after the patches, unchanged files get the mtime of the cached build back.
+          python3 - <<'PY'
+          p = 'dxb/build.sh'; s = open(p).read()
+          hook = '    patches\n    python3 "$GITHUB_WORKSPACE/scripts/check-cpufreq.py" "${WORK_DIR}/xnu"\n    python3 "$GITHUB_WORKSPACE/scripts/check-fbcon.py" "${WORK_DIR}/xnu"\n    python3 "$GITHUB_WORKSPACE/scripts/ci-mtimes.py" restore "${WORK_DIR}/xnu" "${BUILD_DIR}/xnu-src.mtimes"\n'
+          assert s.count('\n    patches\n') == 1
+          open(p, 'w').write(s.replace('\n    patches\n', '\n' + hook))
+          PY
+          grep -q 'ci-mtimes.py" restore' dxb/build.sh
+          ls dxb/patches/15.0 | wc -l
+
+      - name: Toolchain
+        run: |
+          brew install jq gum bash cmake ninja
+          # build.sh only checks that xcodes exists; Xcode is preinstalled on the runner.
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_16.2*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      # The previous build's objects and tools (dxb/build, dxb/fakeroot), keyed on dxb and the base patches; the board
+      # patches are left out of the key on purpose: their changes are what the incremental make rebuilds.
+      - name: Restore build cache
+        if: inputs.clean != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dxb/build
+            dxb/fakeroot
+          key: xnu-obj-${{ env.DXB_SHA }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/base/**', 'scripts/sync-base.py') }}-${{ github.run_id }}
+          restore-keys: xnu-obj-${{ env.DXB_SHA }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/base/**', 'scripts/sync-base.py') }}-
+
+      - name: Drop cached outputs
+        run: |
+          # build.sh skips xnu when its kernel exists; the installed kernels must be this run's or none
+          rm -f dxb/build/xnu.obj/kernel.* || true
+          rm -rf dxb/fakeroot/System/Library/Kernels || true
+          du -sh dxb/build dxb/fakeroot 2>/dev/null || true
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+          # dxb only warns when a patch does not apply; for ours that would silently drop it.
+          ! grep -E 'Skipping patch .*ishtar-' build.log
+
+      - name: Save source manifest
+        if: success()
+        run: python3 scripts/ci-mtimes.py save dxb/xnu dxb/build/xnu-src.mtimes
+
+      - uses: actions/cache/save@v4
+        if: success()
+        with:
+          path: |
+            dxb/build
+            dxb/fakeroot
+          key: xnu-obj-${{ env.DXB_SHA }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/base/**', 'scripts/sync-base.py') }}-${{ github.run_id }}
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp dxb/build.log out/ 2>/dev/null || true
+          grep -E '(fatal )?error: ' dxb/build.log | sort -u | head -200 > out/errors.txt || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ishtar-kernel
+          path: out/

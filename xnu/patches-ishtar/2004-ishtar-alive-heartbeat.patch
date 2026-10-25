@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/IshtarPlatformExpert.cpp b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+index e77e54b..01686b7 100644
+--- a/iokit/Kernel/arm/IshtarPlatformExpert.cpp
++++ b/iokit/Kernel/arm/IshtarPlatformExpert.cpp
+@@ -9,6 +9,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ extern "C" int ishtar_reboot_restart(int panic_restart);
+ extern "C" void ishtar_reboot_note_panic(void);
+@@ -30,6 +33,23 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IshtarPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Bring-up heartbeat (boot-arg ishtaralive=N seconds, 0 = off): one line every N s for a minute.
++ * It sleeps on the timer, so lines appearing means timer interrupts and the scheduler work.
++ */
++static void
++ishtar_alive_thread(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	for (uint32_t n = 1; n * secs <= 60; n++) {
++		IOSleep(secs * 1000);
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		IOLog("ISHTAR: alive %u (%llu ms since boot)\n", n, ns / 1000000ull);
++	}
++	thread_terminate(current_thread());
++}
++
+ bool
+ IshtarPlatformExpert::start(IOService *provider)
+ {
+@@ -39,6 +59,12 @@ IshtarPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("ISHTAR: platform expert registered\n");
++	uint32_t alive = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("ishtaralive", &alive, sizeof(alive)) && alive > 0 &&
++	    kernel_thread_start(ishtar_alive_thread, (void *)(uintptr_t)alive, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	if (ishtar_board_ref()) {
+ 		publishResource("IORTC");       /* 0245: the PM8998 RTC below; IOKitInitializeTime waits up to 30 s for it */
+ 	}

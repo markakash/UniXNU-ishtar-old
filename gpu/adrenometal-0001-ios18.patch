@@ -1,0 +1,34 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index ad7f7a4..3129dbb 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -111,8 +111,18 @@ static void journal(const std::string &line) {
+ @interface NBObject : NSObject
+ @property(atomic,copy) NSString *label;
+ @end
++static void nbIgnoredSetter(id self, SEL selector) {(void)self;(void)selector;}   // the setter's own arguments are ignored
+ @implementation NBObject
+ - (id<MTLDevice>)device {return gDeviceObject;}
++// ishtar (iOS 18.7.8): QuartzCore sends setters the iPadOS 17 runtime never did (-[MTLCommandBuffer setResponsibleTaskIDs:count:],
++// task attribution). A setter none of these classes implements is logged once and ignored instead of raising in the compositor.
++// ponytail: setters only; a missing getter still reaches doesNotRecognizeSelector, implement it when the log names one.
+++ (BOOL)resolveInstanceMethod:(SEL)selector {
++ const char *name=sel_getName(selector);
++ if(strncmp(name,"set",3) || ![self isSubclassOfClass:[NBObject class]])return [super resolveInstanceMethod:selector];
++ NBLOG(@"native-metal: ignoring %s %s",class_getName(self),name);
++ return class_addMethod(self,selector,(IMP)nbIgnoredSetter,"v@:");
++}
+ - (void)doesNotRecognizeSelector:(SEL)selector {
+  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
+@@ -1587,7 +1597,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+ #endif
+ #if TARGET_OS_IPHONE
+  // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
+- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
++ // ishtar (iOS 18.7.8): the base differs from iPadOS 17's 536 bytes; the subclass adds no ivars, so only log the size.
++ if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
++ if(class_getInstanceSize(base)!=536)NBLOG(@"native-metal: _MTLDevice is %zu bytes (iPadOS 17.7.11: 536)",class_getInstanceSize(base));
+ #endif
+  if(!base)base=[NSObject class];
+  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;

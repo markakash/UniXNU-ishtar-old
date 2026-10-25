@@ -1,0 +1,166 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 4d1c4f7..e76c335 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1372,7 +1372,8 @@ geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
+  */
+ static int gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div);
+ static void gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+-static int gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n);
++static int gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx);
++static bool gpi_loop;   /* SE loopback (CONFIG0 flag bit 0), full duplex of ntx bytes: data-path self test */
+ 
+ static void
+ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+@@ -1435,13 +1436,44 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+ 	delay(200000);
+ 	static const uint8_t id_tx[8] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };
+ 	uint8_t rx[16] = { 0 };
+-	int rc = gsi ? gpi_spi_xfer(id_tx, rx, sizeof(id_tx)) : geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
++	int rc;
++	if (gsi) {
++		static const uint8_t lb[8] = { 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0 };
++		gpi_loop = true;
++		rc = gpi_spi_xfer2(lb, 8, rx, 0);
++		gpi_loop = false;
++		printf("ISHTAR TOUCHPROBE: loopback rc %d: %02x %02x %02x %02x %02x %02x %02x %02x (expect 12 34 .. f0)\n", rc, rx[0],
++		    rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++		/* FTS HW read: write FB + addr 0x20000000, read dummy + chip id */
++		rc = gpi_spi_xfer2(id_tx, 5, rx, 3);
++		printf("ISHTAR TOUCHPROBE: fts chip id rc %d: %02x %02x %02x (dummy, id0, id1; expect 36 4x/5x/39)\n", rc,
++		    rx[0], rx[1], rx[2]);
++		/*
++		 * Without running fw the FTM5 talks SPI3 (MISO unused): stock fts_spi4_mode_set (SALIXP), then
++		 * fts_system_reset (0x81 -> 0x20000024). HW reg write = FA + 4-byte address + value.
++		 */
++		static const uint8_t spi4[][2] = { { 0x32, 0x10 }, { 0x34, 0x02 }, { 0x3e, 0x07 }, { 0x3d, 0x30 }, { 0x2d, 0x02 } };
++		for (uint32_t i = 0; i < 5; i++) {
++			uint8_t w[6] = { 0xfa, 0x20, 0x00, 0x00, spi4[i][0], spi4[i][1] };
++			gpi_spi_xfer2(w, 6, rx, 0);
++		}
++		delay(1000);
++		rc = gpi_spi_xfer2(id_tx, 5, rx, 3);
++		printf("ISHTAR TOUCHPROBE: fts chip id after spi4 rc %d: %02x %02x %02x\n", rc, rx[0], rx[1], rx[2]);
++		static const uint8_t sysrst[6] = { 0xfa, 0x20, 0x00, 0x00, 0x24, 0x81 };
++		gpi_spi_xfer2(sysrst, 6, rx, 0);
++		delay(200000);
++		rc = gpi_spi_xfer2(id_tx, 5, rx, 3);
++		printf("ISHTAR TOUCHPROBE: fts chip id after system reset rc %d: %02x %02x %02x\n", rc, rx[0], rx[1], rx[2]);
++		static const uint8_t ev_cmd[1] = { 0x87 };
++		rc = gpi_spi_xfer2(ev_cmd, 1, rx, 9);
++		printf("ISHTAR TOUCHPROBE: fts event rc %d: %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", rc, rx[0], rx[1],
++		    rx[2], rx[3], rx[4], rx[5], rx[6], rx[7], rx[8]);
++		return;
++	}
++	rc = geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
+ 	printf("ISHTAR TOUCHPROBE: fts chip id rc %d: %02x %02x %02x (dummy, id0, id1; expect 36 4x/5x/39)\n", rc,
+ 	    rx[5], rx[6], rx[7]);
+-	static const uint8_t ev_tx[10] = { 0x87 };
+-	rc = gsi ? gpi_spi_xfer(ev_tx, rx, sizeof(ev_tx)) : geni_spi_xfer(se, ev_tx, rx, sizeof(ev_tx));
+-	printf("ISHTAR TOUCHPROBE: fts event rc %d: %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", rc, rx[1], rx[2],
+-	    rx[3], rx[4], rx[5], rx[6], rx[7], rx[8], rx[9]);
+ }
+ 
+ /*
+@@ -1627,6 +1659,9 @@ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ 	tp_step("smmu map");
+ 	if (sm) {
+ 		printf("ISHTAR TOUCHPROBE: stage 6: apps_smmu sid 0x436 -> %d\n", ishtar_smmu_map_sid(0x436));
++		/* stock DT: qupv3_2 wrapper iommus = <0x423>; SPI data buffers are mapped on the wrapper (data master), GPI 0x436 only fetches TREs/events */
++		printf("ISHTAR TOUCHPROBE: stage 6: apps_smmu sid 0x423 (probe %d) -> %d\n", ishtar_smmu_probe_sid(0x423, 1),
++		    ishtar_smmu_map_sid(0x423));
+ 	}
+ 	tp_step("gpi map + first read");
+ 	gd.gpi = ml_io_map(GPI_PA, 0x60000);
+@@ -1779,35 +1814,49 @@ gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint
+ 	(*wp)++;
+ }
+ 
+-/* Full-duplex SPI of n bytes (<= 1 KiB) through GPI: TX = CONFIG0 + GO(DUPLEX) + DMA, RX = DMA. */
++/*
++ * SPI write-then-read through GPI, TRE for TRE as stock HyperOS (spi-msm-geni setup_gsi_xfer, ipc log of
++ * 880000.spi): TX = CONFIG0(word 4, pack 3, clk idx 2 / div 4 = 48 MHz / 4) + GO(TX, FRAG if a read follows)
++ * + DMA(IEOT); read part: TX = GO(RX, rx_len, link_rx, IEOB), RX = DMA; TX doorbell before RX. Never duplex.
++ * ponytail: clk idx/div hardcoded from the stock log (fts spi-max 12 MHz).
++ */
+ static int
+-gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
++gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx)
+ {
+-	if (!gd.up || n > 0x400) {
++	if (!gd.up || !ntx || ntx > 0x400 || nrx > 0x400) {
+ 		return -1;
+ 	}
+-	memcpy((void *)(gd.dma + GD_TXBUF), tx, n);
+-	bzero((void *)(gd.dma + GD_RXBUF), n);
++	uint32_t n = nrx;
++	memcpy((void *)(gd.dma + GD_TXBUF), tx, ntx);
++	memset((void *)(gd.dma + GD_RXBUF), 0xa5, 0x400);   /* A5 left = RX data never landed */
+ 	uint64_t txb = gd.pa + GD_TXBUF, rxb = gd.pa + GD_RXBUF;
+-	/* exactly Linux gpi_create_spi_tre: RX DMA without IEOT, DUPLEX GO with rx_len 0 */
+-	gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), n, 0x10u << 16);
+-	gpi_tre(GD_TX, &gd.tx_wp, 4u | (1u << 24) | (1u << 25), 0, gd.div | (0u << 16), (0x22u << 16) | 1u);
+-	gpi_tre(GD_TX, &gd.tx_wp, 3u | (0u << 8), 0, 0, (0x20u << 16) | 1u | (1u << 11));
+-	gpi_tre(GD_TX, &gd.tx_wp, (uint32_t)txb, (uint32_t)(txb >> 32), n, (0x10u << 16) | (1u << 9));
++	gpi_tre(GD_TX, &gd.tx_wp, 4u | (1u << 24) | (1u << 25) | (gpi_loop ? 1u << 8 : 0), 0, 4u | (2u << 16), (0x22u << 16) | 1u);
++	if (gpi_loop) {
++		/* DUPLEX GO (link_rx + chain), RX DMA of ntx bytes queued first */
++		n = ntx;
++		gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), ntx, 0x10u << 16);
++		gpi_tre(GD_TX, &gd.tx_wp, 3u, 0, ntx, (0x20u << 16) | (1u << 11) | 1u);
++		nrx = 0;
++	} else
++	gpi_tre(GD_TX, &gd.tx_wp, 1u | (nrx ? 1u << 26 : 0), 0, 0, (0x20u << 16) | 1u);
++	gpi_tre(GD_TX, &gd.tx_wp, (uint32_t)txb, (uint32_t)(txb >> 32), ntx, (0x10u << 16) | (1u << 9));
+ 	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
+-	tp_step("rx doorbell");
+-	gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
+-	tp_step("rx doorbell written");
+-	printf("ISHTAR TOUCHPROBE: after rx db: ch1 %#x rp %#x glob %#x type %#x err %#x\n", gpi_rd(GPI_CH(1)),
+-	    gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23200u)));
+-	/* one TX TRE per doorbell (CONFIG0, GO, DMA) to see which one the reset follows */
+-	static const char *const tn[3] = { "tx db config0", "tx db go", "tx db dma" };
+-	for (uint32_t k = 3; k > 0; k--) {
+-		tp_step(tn[3 - k]);
+-		gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + ((gd.tx_wp - k + 1) % GPI_CH_ELS) * GPI_RING_EL));
+-		delay(20000);
+-		printf("ISHTAR TOUCHPROBE: %s: ch0 %#x rp %#x gpii-stts %#x se8 status %#x m-irq %#x\n", tn[3 - k], gpi_rd(GPI_CH(0)),
+-		    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23118u)), touch_rd(gd.se, 0x40), touch_rd(gd.se, 0x610));
++	tp_step("tx doorbell (write part)");
++	gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++	delay(20000);
++	printf("ISHTAR TOUCHPROBE: write part: ch0 %#x rp %#x gpii-stts %#x se8 status %#x\n", gpi_rd(GPI_CH(0)),
++	    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23118u)), touch_rd(gd.se, 0x40));
++	if (gpi_loop) {
++		gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
++	}
++	if (nrx) {
++		gpi_tre(GD_TX, &gd.tx_wp, 2u, 0, nrx, (0x20u << 16) | (1u << 11) | (1u << 8));
++		gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), nrx, 0x10u << 16);
++		ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
++		tp_step("tx doorbell (rx go)");
++		gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++		tp_step("rx doorbell");
++		gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
+ 	}
+ 	tp_step("tx doorbell written");
+ 	printf("ISHTAR TOUCHPROBE: after tx db: ch0 %#x rp %#x ch1 rp %#x glob %#x type %#x\n", gpi_rd(GPI_CH(0)),
+@@ -1815,7 +1864,7 @@ gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+ 	/* wait for two completion events (TX and RX end of transfer) */
+ 	int got = 0;
+ 	uint32_t ev[4] = { 0 };
+-	for (int i = 0; i < 2000 && got < 2; i++) {     /* 200 ms */
++	for (int i = 0; i < 2000 && got < 3; i++) {     /* 200 ms: TX EOT, RX-GO EOB, RX EOT */
+ 		ishtar_dma_sync_va((const void *)(gd.dma + GD_EV), GPI_EV_ELS * GPI_RING_EL);
+ 		volatile uint32_t *e = (volatile uint32_t *)(gd.dma + GD_EV + (gd.ev_rp % GPI_EV_ELS) * GPI_RING_EL);
+ 		if (e[3] != 0) {
+@@ -1831,7 +1880,8 @@ gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+ 	gpi_wr(GPI_EV_DB, (uint32_t)(gd.pa + GD_EV + ((gd.ev_rp + GPI_EV_ELS - 1) % GPI_EV_ELS) * GPI_RING_EL));
+ 	ishtar_dma_sync_va((const void *)(gd.dma + GD_RXBUF), n);
+ 	memcpy(rx, (const void *)(gd.dma + GD_RXBUF), n);
+-	if (got < 2) {
++	printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x\n", got, ev[0], ev[1], ev[2], ev[3]);
++	if (got < 1) {
+ 		printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x, ch0 %#x ch1 %#x glob %#x err %#x\n", got,
+ 		    ev[0], ev[1], ev[2], ev[3], gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(1)), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23200u)));
+ 		/* QUP FW error (TYPE_IRQ bit 6): GPII and SE8 state for diagnosis */

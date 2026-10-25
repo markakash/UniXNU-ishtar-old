@@ -1,0 +1,47 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 81604c2..f61ea7f 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -186,6 +186,26 @@ pe_init_fiq()
+ 	}
+ 
+ #if defined(ISHTAR)
++	/*
++	 * ABL and UEFI leave device interrupts enabled and pending (display, USB, UFS...). A level-triggered
++	 * SPI that no XNU driver handles fires again after every EOI: an interrupt storm as soon as IRQs are
++	 * unmasked, and nothing else runs. Disable and clear everything first (UniXNU's ArmCpu does the same
++	 * on SM8550 under Gunyah), then enable only the timer and the IPI below. Drivers enable their own SPIs.
++	 */
++	static bool ishtar_spis_quiet;
++	if (!ishtar_spis_quiet) {
++		uint32_t lines = ((gicd_read32(ISHTAR_GICD_TYPER) & 0x1fu) + 1u) * 32u;
++		for (uint32_t id = 32; id < lines && id < 1020; id += 32) {
++			gicd_write32(ISHTAR_GICD_ICENABLER + id / 8, 0xFFFFFFFF);
++			gicd_write32(ISHTAR_GICD_ICPENDR + id / 8, 0xFFFFFFFF);
++		}
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++		ishtar_spis_quiet = true;
++	}
++	gicr_write32(ISHTAR_GICR_ICENABLER0, 0xFFFFFFFF);
++	gicr_write32(ISHTAR_GICR_ICPENDR0, 0xFFFFFFFF);
+ 	/*
+ 	 * Real hardware with two security states: Group 0 is TrustZone's and
+ 	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+diff --git a/pexpert/pexpert/arm64/ISHTAR.h b/pexpert/pexpert/arm64/ISHTAR.h
+index 9b63216..85958a0 100644
+--- a/pexpert/pexpert/arm64/ISHTAR.h
++++ b/pexpert/pexpert/arm64/ISHTAR.h
+@@ -79,6 +79,11 @@
+ #define GICR_IGROUPR0                           0x10080
+ #define GICR_ISENABLER0                         0x10100
+ #define GICR_IPRIORITYR0                        0x10400
++#define ISHTAR_GICD_TYPER                       0x4
++#define ISHTAR_GICD_ICENABLER                   0x180
++#define ISHTAR_GICD_ICPENDR                     0x280
++#define ISHTAR_GICR_ICENABLER0                  0x10180
++#define ISHTAR_GICR_ICPENDR0                    0x10280
+ 
+ #define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
+ #define GICR_TYPER_LAST                         0x10

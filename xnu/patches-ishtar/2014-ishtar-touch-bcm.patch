@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 7621c93..0940a43 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1529,6 +1529,82 @@ gpi_ring_ctx(uint32_t ctx, uint32_t db, uint32_t cfg, uint32_t off, uint32_t els
+ 	gpi_wr(db + 4, (uint32_t)((gd.pa + off) >> 32));   /* doorbell MSB */
+ }
+ 
++/*
++ * RPMh BCM votes for the QUP2 DMA path (Linux sm8550 interconnect: QUP2 core,
++ * SN3 = aggre2 -> snoc, which carries qhm_qup2). apps_rsc drv-2 (RSC v3, TCS at
++ * +0xd00, ACTIVE TCS 0..2), cmd-db at 0x81c60000. Our TCS IRQ stays masked; polled.
++ * ponytail: fixed vote of 1 unit per BCM, real bandwidth math (cmd-db aux) when needed.
++ */
++static void
++touch_bcm_votes(void)
++{
++	static const char *const names[] = { "QUP2", "SN3", "SN0", "SH0", "MC0" };
++	uint32_t addr[5], n = 0, v = 1;
++	vm_offset_t rsc = ml_io_map(0x17a20000u, 0x4000), db = ml_io_map(0x81c60000u, 0x20000);
++	if (!rsc || !db) {
++		return;
++	}
++	vm_offset_t tcs = rsc + 0xd00;
++	PE_parse_boot_argn("ishtartouchbcmv", &v, sizeof(v));
++	printf("ISHTAR TOUCHPROBE: rpmh id %#x cfg %#x cmd-db magic %#x\n", touch_rd(rsc, 0), touch_rd(rsc, 0xc), touch_rd(db, 4));
++	if (touch_rd(db, 4) != 0x0c0330dbu || ((touch_rd(rsc, 0) >> 16) & 0xff) != 3) {
++		return;
++	}
++	for (uint32_t k = 0; k < 5; k++) {
++		uint32_t key0 = 0, key1 = 0;
++		for (uint32_t i = 0; names[k][i]; i++) {
++			*(i < 4 ? &key0 : &key1) |= (uint32_t)(uint8_t)names[k][i] << (8 * (i % 4));
++		}
++		addr[n] = 0;
++		for (uint32_t h = 8; h < 8 + 16 * 8; h += 16) {
++			uint32_t w0 = touch_rd(db, h), cnt = touch_rd(db, h + 4) >> 16, e = 144 + (w0 >> 16);
++			for (uint32_t j = 0; (w0 & 0xffff) == 5 && j < cnt && e + 24 * j + 24 <= 0x20000; j++) {
++				if (touch_rd(db, e + 24 * j) == key0 && touch_rd(db, e + 24 * j + 4) == key1) {
++					addr[n] = touch_rd(db, e + 24 * j + 16);
++				}
++			}
++		}
++		printf("ISHTAR TOUCHPROBE: bcm %s addr %#x\n", names[k], addr[n]);
++		n += addr[n] != 0;
++	}
++	int t = -1;
++	for (uint32_t i = 0; i < 3; i++) {
++		uint32_t b = i * 0x2a0;
++		printf("ISHTAR TOUCHPROBE: tcs%u status %#x ctl %#x en %#x wait %#x\n", i, touch_rd(tcs, b + 0x28),
++		    touch_rd(tcs, b + 0x24), touch_rd(tcs, b + 0x2c), touch_rd(tcs, b + 0x20));
++		if (t < 0 && touch_rd(tcs, b + 0x28) && !touch_rd(tcs, b + 0x24) && !touch_rd(tcs, b + 0x2c)) {
++			t = (int)i;
++		}
++	}
++	if (t < 0 || !n) {
++		return;
++	}
++	uint32_t b = (uint32_t)t * 0x2a0, mask = (1u << n) - 1, done = 0;
++	touch_wr(tcs, 0x0, touch_rd(tcs, 0x0) & ~(1u << t));     /* IRQ_EN: ours masked */
++	for (uint32_t c = 0; c < n; c++) {
++		touch_wr(tcs, b + 0x34 + 24 * c, 8 | (1u << 8) | (1u << 16));            /* write, resp req, len 4 */
++		touch_wr(tcs, b + 0x38 + 24 * c, addr[c]);
++		touch_wr(tcs, b + 0x3c + 24 * c, (1u << 30) | (1u << 29) | (v << 14) | v);  /* commit, valid, x, y */
++	}
++	touch_wr(tcs, b + 0x20, mask);
++	touch_wr(tcs, b + 0x2c, mask);
++	touch_wr(tcs, b + 0x24, 1u << 16);
++	touch_wr(tcs, b + 0x24, (1u << 16) | (1u << 24));
++	for (int i = 0; i < 1000 && done != mask; i++) {
++		done = 0;
++		for (uint32_t c = 0; c < n; c++) {
++			done |= ((touch_rd(tcs, b + 0x40 + 24 * c) & 0x10100) == 0x10100) << c;
++		}
++		delay(100);
++	}
++	printf("ISHTAR TOUCHPROBE: bcm vote %u on tcs%d: done %#x/%#x status %#x irq %#x\n", v, t, done, mask,
++	    touch_rd(tcs, b + 0x28), touch_rd(tcs, 0x4));
++	touch_wr(tcs, b + 0x24, 0);
++	touch_wr(tcs, b + 0x2c, 0);
++	touch_wr(tcs, b + 0x20, 0);
++	touch_wr(tcs, 0x8, 1u << t);
++}
++
+ static int
+ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ {
+@@ -1536,6 +1612,12 @@ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ 	extern int ishtar_smmu_map_sid(unsigned sid);
+ 	int sm = -1, st = ishtar_smmu_probe_sid(0x436, 1);
+ 	(void)gcc;
++	int bcm = 1;
++	PE_parse_boot_argn("ishtartouchbcm", &bcm, sizeof(bcm));
++	if (bcm) {
++		tp_step("bcm votes");
++		touch_bcm_votes();
++	}
+ 	PE_parse_boot_argn("ishtartouchsmmu", &sm, sizeof(sm));
+ 	if (sm < 0) {
+ 		sm = st == 0 || st == 3;
+@@ -1551,7 +1633,7 @@ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ 	gd.div = div;
+ 	int want = -1;
+ 	PE_parse_boot_argn("ishtartouchgpii", &want, sizeof(want));
+-	if (gd.gpi && (want < 1 || want > 5)) {
++	if (gd.gpi && (want < 0 || want > 5)) {     /* SE8 is static GPII 0 (downstream dmas option 2) */
+ 		/* read-only scan: owned GPIIs read sane values, protected ones read junk; then stop */
+ 		for (uint32_t n = 0; n < 6; n++) {     /* reading GPII 6+ resets the SoC (not HLOS) */
+ 			gpi_gpii = n;

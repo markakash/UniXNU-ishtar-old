@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/ishtar_smmu.c b/bsd/dev/ishtar_smmu.c
+index 88e6ace..ef44f47 100644
+--- a/bsd/dev/ishtar_smmu.c
++++ b/bsd/dev/ishtar_smmu.c
+@@ -48,6 +48,8 @@ static int smmu_cb = -1;                /* shared translating context bank */
+ static unsigned smmu_nsmr;
+ static int smmu_next_smr;               /* first free SMR to try next */
+ static volatile uint32_t smmu_lock;
++static volatile uint64_t *smmu_l1;      /* bank level-1 table (entries 0-1 = low 2 GiB, free) */
++static uint32_t smmu_cbo;               /* bank register offset */
+ 
+ static uint32_t
+ smmu_rd(uint32_t off)
+@@ -118,6 +120,7 @@ smmu_bank_create(void)
+ 	}
+ 	uint64_t l1_pa = ptoa_64(pn);
+ 	volatile uint64_t *l1 = (volatile uint64_t *)l1v;
++	smmu_l1 = l1;
+ 	for (unsigned i = 2; i < 64; i++) {      /* ishtar: RAM reaches 0x9xxxxxxxx, map 2..64 GiB */
+ 		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
+ 	}
+@@ -130,6 +133,7 @@ smmu_bank_create(void)
+ 	flush_dcache64((addr64_t)l1_pa, L1_SIZE, TRUE);
+ 
+ 	uint32_t cb = cb0 + ((uint32_t)smmu_cb << pgshift);
++	smmu_cbo = cb;
+ 	unsigned asid = (unsigned)smmu_cb;
+ 	smmu_wr(cb + 0x0, 0);                                    /* SCTLR off while programming */
+ 	smmu_wr(cb + 0x58, 0xffffffffu);                        /* FSR clear */
+@@ -156,6 +160,38 @@ smmu_bank_create(void)
+ 	return 0;
+ }
+ 
++/*
++ * Map len bytes at iova (below 2 MiB) to pa with 4K pages in the shared bank, for
++ * masters whose stock DT limits IOVAs (qcom,iommu-dma-addr-pool). One call per boot.
++ */
++int
++ishtar_smmu_map_low(uint64_t iova, uint64_t pa, uint32_t len)
++{
++	vm_offset_t t = 0;
++	if (!smmu_l1 || smmu_l1[0] || iova + len > 0x200000 ||
++	    kmem_alloc_contig(kernel_map, &t, 2 * L1_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return EINVAL;
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)t, *l3 = (volatile uint64_t *)(t + L1_SIZE);
++	uint64_t l2_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)t));
++	uint64_t l3_pa = l2_pa + L1_SIZE;       /* 16K kernel pages: same page, +4K */
++	for (uint32_t o = 0; o < len; o += 0x1000) {
++		l3[((iova + o) >> 12) & 511] = (pa + o) | 1u << 10 | 2u << 8 | 1u << 6 | 3;
++	}
++	l2[0] = l3_pa | 3;
++	ishtar_dma_sync_va((const void *)t, 2 * L1_SIZE);
++	smmu_l1[0] = l2_pa | 3;
++	ishtar_dma_sync_va((const void *)smmu_l1, 8);
++	smmu_wr(smmu_cbo + 0x618, 0);
++	smmu_wr(smmu_cbo + 0x7f0, 0);
++	for (int i = 0; i < 100000 && (smmu_rd(smmu_cbo + 0x7f4) & 1); i++) {
++		delay(1);
++	}
++	printf("ISHTAR SMMU: iova %#llx -> %#llx (%#x)\n", iova, pa, len);
++	return 0;
++}
++
+ /* Map one stream ID to the shared translating bank. Idempotent per SID. */
+ int
+ ishtar_smmu_map_sid(unsigned sid)
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 0940a43..931d2df 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1658,6 +1658,13 @@ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ 	}
+ 	gd.pa = ptoa_64(pn);
+ 	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
++	/* stock DT: gpi_dma2 qcom,iommu-dma-addr-pool = <0x100000 0x100000>; gd.pa is the device address */
++	extern int ishtar_smmu_map_low(uint64_t iova, uint64_t pa, uint32_t len);
++	int low = 1;
++	PE_parse_boot_argn("ishtartouchlow", &low, sizeof(low));
++	if (low && sm && ishtar_smmu_map_low(0x100000, gd.pa, GD_SIZE) == 0) {
++		gd.pa = 0x100000;
++	}
+ 	printf("ISHTAR TOUCHPROBE: stage 6: GPII %u ch0 %#x ch1 %#x ev %#x, DMA %#llx\n", GPI_GPII, gpi_rd(GPI_CH(0)),
+ 	    gpi_rd(GPI_CH(1)), gpi_rd(GPI_EV), gd.pa);
+ 	tp_step("SE8 gsi mode");
+@@ -1776,6 +1783,23 @@ gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+ 	if (got < 2) {
+ 		printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x, ch0 %#x ch1 %#x glob %#x err %#x\n", got,
+ 		    ev[0], ev[1], ev[2], ev[3], gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(1)), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23200u)));
++		/* QUP FW error (TYPE_IRQ bit 6): GPII and SE8 state for diagnosis */
++		printf("ISHTAR TOUCHPROBE: gpii irq-stts %#x type %#x ch-irq %#x ev-irq %#x ieob %#x glob %#x\n", gpi_rd(GPI_N(0x23118u)),
++		    gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23090u)), gpi_rd(GPI_N(0x23094u)), gpi_rd(GPI_N(0x230b0u)), gpi_rd(GPI_N(0x23100u)));
++		for (uint32_t k = 0; k < 2; k++) {
++			printf("ISHTAR TOUCHPROBE: ch%u ctx %#x %#x %#x %#x %#x %#x %#x %#x scr %#x %#x %#x %#x\n", k,
++			    gpi_rd(GPI_CH(k)), gpi_rd(GPI_CH(k) + 4), gpi_rd(GPI_CH(k) + 8), gpi_rd(GPI_CH(k) + 0xc),
++			    gpi_rd(GPI_CH(k) + 0x10), gpi_rd(GPI_CH(k) + 0x14), gpi_rd(GPI_CH(k) + 0x18), gpi_rd(GPI_CH(k) + 0x1c),
++			    gpi_rd(GPI_CH(k) + 0x60), gpi_rd(GPI_CH(k) + 0x64), gpi_rd(GPI_CH(k) + 0x68), gpi_rd(GPI_CH(k) + 0x6c));
++		}
++		vm_offset_t se = gd.se;
++		static const uint16_t sr[] = { 0x20, 0x24, 0x28, 0x40, 0x48, 0x64, 0x68, 0x7c, 0x258, 0x25c, 0x268, 0x600, 0x610,
++		    0x614, 0x640, 0x644, 0x800, 0x804, 0xc40, 0xd40, 0xe18, 0xe1c, 0xe10, 0xe14 };
++		for (uint32_t i = 0; i < sizeof(sr) / sizeof(sr[0]); i += 6) {
++			printf("ISHTAR TOUCHPROBE: se8 %03x=%#x %03x=%#x %03x=%#x %03x=%#x %03x=%#x %03x=%#x\n",
++			    sr[i], touch_rd(se, sr[i]), sr[i + 1], touch_rd(se, sr[i + 1]), sr[i + 2], touch_rd(se, sr[i + 2]),
++			    sr[i + 3], touch_rd(se, sr[i + 3]), sr[i + 4], touch_rd(se, sr[i + 4]), sr[i + 5], touch_rd(se, sr[i + 5]));
++		}
+ 		return -1;
+ 	}
+ 	return 0;

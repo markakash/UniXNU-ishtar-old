@@ -1,0 +1,64 @@
+diff --git a/iokit/Kernel/arm/IshtarDpu.cpp b/iokit/Kernel/arm/IshtarDpu.cpp
+index 52c0ce8..bc19e96 100644
+--- a/iokit/Kernel/arm/IshtarDpu.cpp
++++ b/iokit/Kernel/arm/IshtarDpu.cpp
+@@ -519,7 +519,8 @@ bool ishtar_lowpool_setup_range(uint64_t base, uint64_t size, uint32_t minW, uin
+ /* Knobs (live over the push link: push.py --set dpu.zc 0): zero-copy on/off, a wait before each scan (us). */
+ extern "C" void ishtar_knob_register(const char *name, volatile uint32_t *value);   /* bsd/dev/ishtar_push.c */
+ static volatile uint32_t gZcEnable = 1, gZcDelayUs;
+-extern "C" { volatile uint32_t ishtar_dpu_layerlog, ishtar_dpu_swaplog; }   /* swaplog=N: log the next N zero-copy swaps */   /* knob dpu.layerlog=N: log the next N swaps with several layers */
++extern "C" { volatile uint32_t ishtar_dpu_layerlog, ishtar_dpu_swaplog; }
++extern "C" volatile uint32_t native_adreno_maint;       /* a740/NativeAdrenoVm.cpp */   /* swaplog=N: log the next N zero-copy swaps */   /* knob dpu.layerlog=N: log the next N swaps with several layers */
+ 
+ namespace {
+ constexpr uint32_t kSrcSize = 0x00, kSrcXY = 0x08, kOutSize = 0x0c, kOutXY = 0x10;
+@@ -566,6 +567,7 @@ ishtar_dpu_zc_setup(uint32_t canvasW, uint32_t canvasH)
+ 	ishtar_knob_register("dpu.zcdelay", &gZcDelayUs);
+ 	ishtar_knob_register("dpu.layerlog", &ishtar_dpu_layerlog);
+ 	ishtar_knob_register("dpu.swaplog", &ishtar_dpu_swaplog);
++	ishtar_knob_register("gpu.maint", &native_adreno_maint);
+ 	IOLog("ISHTAR DPU: zero-copy armed: canvas %ux%u, pool 0x%llx..0x%llx\n", canvasW, canvasH, poolBase, d.pa[0] + kCarveoutBytes);
+ 	ishtar_dsi_probe(d.pa[0] + frame, poolBase);
+ 	return true;
+diff --git a/iokit/Kernel/arm/a740/NativeAdrenoVm.cpp b/iokit/Kernel/arm/a740/NativeAdrenoVm.cpp
+index 5a72a93..cecc9c8 100644
+--- a/iokit/Kernel/arm/a740/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/a740/NativeAdrenoVm.cpp
+@@ -11,11 +11,18 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
+  * attributes then needs no CPU cache maintenance. 0 keeps every mapping maintained as before. Counters: maintenance passes skipped for
+  * coherent mappings at map, unmap, submission and completion. */
+ extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
++/* knob gpu.maint (live): maintain anyway what coherence skips. 1 clean imports before a submission, 2 invalidate GPU-written
++ * imports after it, 4 the coherent (read) mappings too. Finds which skipped half shows stale pixels. */
++extern "C" {volatile uint32_t native_adreno_maint=1;}   /* 1 by default: the dashed needle (CPU lines over render targets) */
++static bool skipMaint(unsigned writeback,const NativeAdrenoMemory *memory,unsigned bit)
++{
++    const uint32_t f=native_adreno_maint;
++    return writeback && native_adreno_io_coherent ? !(f&4u) : (memory->imported() && native_adreno_io_coherent && !(f&bit));
++}
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ /* GPU-written imports (render targets) are mapped non-coherent (the GPU stopped inside its end-of-pass clean writing them through
+  * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
+  * maintenance per submission, which cost about 60 ms per frame. */
+-static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->imported() && native_adreno_io_coherent;}
+ static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
+ {return a<b+bb && b<a+ab;}
+ /* Mappings of one cache/shareability/privilege class may share pages; only pages shared across classes refuse. */
+@@ -334,7 +341,7 @@ IOReturn NativeAdrenoVm::publishMapped()
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
++        if(skipMaint(m.writeback,m.memory,1u)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+@@ -345,7 +352,7 @@ IOReturn NativeAdrenoVm::acquireImported()
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
++        if(skipMaint(m.writeback,m.memory,2u)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;

@@ -1,0 +1,12 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 55c0577..ccc7d89 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -805,6 +805,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		OSSafeReleaseNULL(matching);
+ 		int ufs_error = ishtar_ufs_rootdev(root);
+ 		if (ufs_error) {
++			IOSleep(10000);         /* ishtar: let the console draw the ISHTAR UFS: lines before the panic */
+ 			panic("IOFindBSDRoot: ISHTAR UFS root %s unavailable: %d", rdBootVar, ufs_error);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);

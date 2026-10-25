@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 931d2df..4d1c4f7 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1371,6 +1371,7 @@ geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
+  * one dummy byte; expect 0x36 0x48/0x50/0x40/0x39) and one FIFO event (0x87, one dummy byte). Reads only on the IC.
+  */
+ static int gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div);
++static void gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+ static int gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n);
+ 
+ static void
+@@ -1725,6 +1726,48 @@ gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
+ 	    v, c[0], c[1], s0, s1);
+ 	gd.tx_wp = gd.rx_wp = 0;
+ 	gd.up = ((s0 >> 20) & 0xf) == 2 && ((s1 >> 20) & 0xf) == 2;
++	/* polled driver: mask every GPII IRQ source once commands are done (INTSET stays IRQ, not MSI) */
++	int noirq = 1;
++	PE_parse_boot_argn("ishtartouchnoirq", &noirq, sizeof(noirq));
++	vm_offset_t gicd = ml_io_map(0x17100000u, 0x10000);
++	if (noirq) {
++		gpi_wr(GPI_N(0x23088u), 0);
++		gpi_wr(GPI_N(0x230b8u), 0);
++		gpi_wr(GPI_N(0x23098u), 0);
++		gpi_wr(GPI_N(0x2309cu), 0);
++		gpi_wr(GPI_N(0x23108u), 0);
++		gpi_wr(GPI_N(0x23120u), 0);
++	}
++	printf("ISHTAR TOUCHPROBE: gpi irqs %s; GICD ISENABLER(INTID 620-631) %#x\n", noirq ? "masked" : "on",
++	    gicd ? (touch_rd(gicd, 0x14c) >> 12) & 0xfff : 0xdead);
++	int lock = 1;
++	PE_parse_boot_argn("ishtartouchlock", &lock, sizeof(lock));
++	if (gd.up && lock) {
++		/* one LOCK TRE, no IEOB/IEOT: GSI-only, no SE traffic, no event */
++		gpi_tre(GD_TX, &gd.tx_wp, 0, 0, 0, 0x30u << 16);
++		ishtar_dma_sync_va((const void *)(gd.dma + GD_TX), GPI_CH_ELS * GPI_RING_EL);
++		tp_step("lock tre doorbell");
++		gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++		delay(50000);
++		printf("ISHTAR TOUCHPROBE: after lock: ch0 %#x rp %#x type %#x gpii-stts %#x\n", gpi_rd(GPI_CH(0)),
++		    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23118u)));
++		tp_step("lock done");
++		/* UNLOCK with IEOT: first event-ring write by the engine */
++		gpi_tre(GD_TX, &gd.tx_wp, 0, 0, 0, (0x31u << 16) | (1u << 9));
++		ishtar_dma_sync_va((const void *)(gd.dma + GD_TX), GPI_CH_ELS * GPI_RING_EL);
++		tp_step("unlock+ieot doorbell");
++		gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++		delay(50000);
++		ishtar_dma_sync_va((const void *)(gd.dma + GD_EV), GPI_RING_EL);
++		volatile uint32_t *e = (volatile uint32_t *)(gd.dma + GD_EV);
++		printf("ISHTAR TOUCHPROBE: after unlock: ch0 %#x rp %#x gpii-stts %#x ev0 %08x %08x %08x %08x\n", gpi_rd(GPI_CH(0)),
++		    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23118u)), e[0], e[1], e[2], e[3]);
++		if (e[3]) {
++			e[0] = e[1] = e[2] = e[3] = 0;
++			gd.ev_rp++;
++		}
++		tp_step("unlock done");
++	}
+ 	return gd.up ? 0 : -1;
+ }
+ 
+@@ -1746,9 +1789,10 @@ gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+ 	memcpy((void *)(gd.dma + GD_TXBUF), tx, n);
+ 	bzero((void *)(gd.dma + GD_RXBUF), n);
+ 	uint64_t txb = gd.pa + GD_TXBUF, rxb = gd.pa + GD_RXBUF;
+-	gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), n, (0x10u << 16) | (1u << 9));
++	/* exactly Linux gpi_create_spi_tre: RX DMA without IEOT, DUPLEX GO with rx_len 0 */
++	gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), n, 0x10u << 16);
+ 	gpi_tre(GD_TX, &gd.tx_wp, 4u | (1u << 24) | (1u << 25), 0, gd.div | (0u << 16), (0x22u << 16) | 1u);
+-	gpi_tre(GD_TX, &gd.tx_wp, 3u | (0u << 8), 0, n, (0x20u << 16) | 1u | (1u << 11));
++	gpi_tre(GD_TX, &gd.tx_wp, 3u | (0u << 8), 0, 0, (0x20u << 16) | 1u | (1u << 11));
+ 	gpi_tre(GD_TX, &gd.tx_wp, (uint32_t)txb, (uint32_t)(txb >> 32), n, (0x10u << 16) | (1u << 9));
+ 	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
+ 	tp_step("rx doorbell");
+@@ -1756,8 +1800,15 @@ gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+ 	tp_step("rx doorbell written");
+ 	printf("ISHTAR TOUCHPROBE: after rx db: ch1 %#x rp %#x glob %#x type %#x err %#x\n", gpi_rd(GPI_CH(1)),
+ 	    gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23200u)));
+-	tp_step("tx doorbell");
+-	gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++	/* one TX TRE per doorbell (CONFIG0, GO, DMA) to see which one the reset follows */
++	static const char *const tn[3] = { "tx db config0", "tx db go", "tx db dma" };
++	for (uint32_t k = 3; k > 0; k--) {
++		tp_step(tn[3 - k]);
++		gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + ((gd.tx_wp - k + 1) % GPI_CH_ELS) * GPI_RING_EL));
++		delay(20000);
++		printf("ISHTAR TOUCHPROBE: %s: ch0 %#x rp %#x gpii-stts %#x se8 status %#x m-irq %#x\n", tn[3 - k], gpi_rd(GPI_CH(0)),
++		    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_N(0x23118u)), touch_rd(gd.se, 0x40), touch_rd(gd.se, 0x610));
++	}
+ 	tp_step("tx doorbell written");
+ 	printf("ISHTAR TOUCHPROBE: after tx db: ch0 %#x rp %#x ch1 rp %#x glob %#x type %#x\n", gpi_rd(GPI_CH(0)),
+ 	    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)));

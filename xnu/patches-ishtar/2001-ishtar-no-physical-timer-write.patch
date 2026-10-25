@@ -1,0 +1,15 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 471a543..0ea4493 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2601,8 +2601,10 @@ _enable_virtual_timer(void)
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ 
+ 	__builtin_arm_wsr64(KERNEL_TIMEBASE("CNTV_CTL_EL0"), cntvctl);
++#if !defined(ISHTAR)
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
+ 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
++#endif /* ISHTAR: Gunyah (SM8550) traps EL1 CNTP_* as undefined; its PPI is never enabled in the GIC */
+ #if HAS_APPLE_GENERIC_TIMER
+ 	__builtin_arm_wsr64("AGTCNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
+ #endif

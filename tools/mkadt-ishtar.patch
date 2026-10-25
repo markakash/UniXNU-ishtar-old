@@ -1,0 +1,153 @@
+--- a/tools/base/mkadt.py
++++ b/tools/base/mkadt.py
+@@ -2,7 +2,7 @@
+ """Build the minimal Apple Device Tree that the ISHTAR xnu needs to boot.
+ 
+ Only what the early boot path actually reads (see NOTES.md); every MMIO
+-address comes from the ishtar live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board ishtar|ishtar] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
++address comes from the ishtar live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board ishtar] [--mem BASE:SIZE] [--no-ufs] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+ """
+ import hashlib, os, struct, sys
+ 
+@@ -42,34 +42,22 @@
+ 
+ BOARDS = {
+     'ishtar': dict(
+-        fb=(0x9c000000, 0x1700000), fb_wh=(1080, 2400),
+-        compat=['xiaomi,ishtar', 'qcom,sm7150'],
+-        # 0-5 Cortex-A55, 6-7 Cortex-A76
+-        cpu_compat='qcom,kryo470', big_from=6, freqs=(1804800000, 2304000000)),
+-    'ishtar': dict(
+-        # cont_splash_mem@9d400000, simple-framebuffer 1080x2246 (mainline ishtar-common)
+-        fb=(0x9d400000, 0x2400000), fb_wh=(1080, 2246),
+-        # 'xiaomi,ishtar' stays: IshtarPlatformExpert matches it
+-        compat=['ishtar,ref-board', 'xiaomi,ishtar', 'qcom,sdm845'],
+-        # 0-3 Kryo 385 Silver (A55), 4-7 Gold (A75)
+-        cpu_compat='qcom,kryo385', big_from=4, freqs=(1766400000, 2803200000),
+-        # Without --highmem: low bank between cont_splash (ends 0x9f800000)
+-        # and ramoops@b0000000. --highmem: same window as ishtar; the live
+-        # FDT memory is <0x80000000 3G>, <0x1_40000000 0xbd4a0000> and every
+-        # fixed carve-out ends below 0xb0400000.
+-        mem=(0x9f800000, 0x0f800000),
+-        # MobileGestalt's Wi-Fi address: /chosen mac-address-wifi0 (set by
+-        # iBoot on real devices), else ADT sdio/wlan/marconi-wifi nodes,
+-        # else it WAITS for an IONetworkController and times out, once per
+-        # question -> lsd's first-boot database seed takes ages (boot 2).
+-        # Synthetic locally administered addresses, not the phone's.
++        # Xiaomi 13 Ultra (SM8550-AB). splash_region@b8000000 from the stock DT; panel M1 1440x3200.
++        fb=(0xb8000000, 0x2b00000), fb_wh=(1440, 3200),
++        compat=['xiaomi,ishtar', 'qcom,sm8550'],
++        # 0-2 A510 (E cluster), 3-4 A715, 5-6 A710, 7 X3 (P cluster): xnu patch 2031 runs them as AMP
++        cpu_compat='qcom,kryo', big_from=3, freqs=(2016000000, 2803200000),
++        amp=True,
++        # GICv3 with GICv4 redistributor frames (xnu/patches-ishtar/2000)
++        gic=(0x17100000, 0x10000, 0x17180000, 0x200000, 0x40000),
++        # arch timer PPIs 13/14/11/12 (stock DT): the EL1 virtual timer is PPI 11 = INTID 27
++        vtimer=27,
++        # Kernel RAM: the DarwinBoot window, given with --mem BASE:SIZE (boot_args carry the real base)
++        mem=None,
+         chosen_extra=[
+-            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01])),
+-            ('mac-address-bluetooth0', BT_MAC),
+-        ],
+-        # /arm-io/bluetooth for bluetoothd/BlueTool (docs/BT_IOS_TRANSPORT.md 3.2). Ishtar has no
+-        # Bluetooth driver: the node is ishtar only.
+-        bluetooth=True),
++            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe0, 0x02])),
++            ('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x77, 0xb0, 0x02])),
++        ]),
+ }
+ 
+ BOOT_MANIFEST_HASH = hashlib.sha384(b'ishtar boot manifest').digest()
+@@ -88,6 +76,11 @@
+ #   ipsw extract -r --dtree -o DIR <OTA URL>; ipsw img4 im4p extract DIR/.../DeviceTree.n104ap.im4p -o n104ap.adt
+ IDENTITIES = {
+     'd22ap': dict(target='D22AP', machine='iPhone10,3', target_type='D22', adt=D22AP_ADT),
++    # n841ap = iPhone XR (A12), the device the iOS 18 root on ishtar is built from (22H352__iPhone11,8): iOS 18 has no
++    # iPhone X, so as d22ap PosterBoard installs no default wallpaper and asset lookups find no artwork. Tree from the IPSW:
++    #   ipsw extract --remote --dtree -o tools/research/ipsw-xr <IPSW URL>; ipsw img4 im4p extract .../DeviceTree.n841ap.im4p -o n841ap.adt
++    'n841ap': dict(target='N841AP', machine='iPhone11,8', target_type='N841',
++                   adt=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-xr/n841ap.adt')),
+     'n104ap': dict(target='N104AP', machine='iPhone12,1', target_type='N104',
+                    adt=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios26/n104ap.adt')),
+ }
+@@ -153,14 +146,13 @@
+ 
+ 
+ def build(seed=None, qemu=False, highmem=False, board='ishtar', display_scale=3, points=(375, 812), lowpool=None,
+-          identity='d22ap'):
++          identity='d22ap', mem=None, with_ufs=True):
+     ident = IDENTITIES[identity]
+     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-ishtar.py)."""
+     b = BOARDS[board]
+     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+-    if board != 'ishtar' and not qemu:
+-        if not highmem:
+-            phys_base, mem_size = b['mem']
++    if not qemu and not highmem:
++        phys_base, mem_size = mem or b['mem'] or sys.exit(f'--board {board} needs --mem BASE:SIZE')
+     fb, fb_size = b['fb']
+     fb_w, fb_h = b['fb_wh']
+     if lowpool is not None:
+@@ -172,6 +164,9 @@
+         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
+             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x} overlaps the kernel RAM {phys_base:#x}+{mem_size:#x}')
+     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
++    gicd_size, gicr_size, gicr_stride = GICD_SIZE, GICR_SIZE, None
++    if 'gic' in b and not qemu:
++        gicd, gicd_size, gicr, gicr_size, gicr_stride = b['gic']
+     # 256 bytes: xnu-12377 asks the bootloader for 4 * SHA-512 (prng_random.c, panics "Expected 256 seed bytes from
+     # bootloader, but got 64"); older kernels copy only the 64 they ask for (PE_get_random_seed clamps)
+     seed = seed if seed is not None else os.urandom(256)
+@@ -182,6 +177,8 @@
+         ph(),
+         ('dram-base', u64(phys_base)),
+         ('dram-size', u64(mem_size)),
++        # UniXNU DarwinBoot: size of the contiguous window it allocates for the kernel
++        ('darwinboot-memory-size', u64(mem_size)),
+         ('random-seed', seed),
+         # xnu-12377 asserts iBoot wrote this (ml_unsafe_kernel_text, machine_routines.c). 1 = kernel text treated as
+         # read-only, which is xnu-11215's default (pmap_ppl_disable FALSE without -unsafe_kernel_text); older kernels ignore it
+@@ -238,7 +235,8 @@
+             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
+             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
++            # ml_parse_cpu_topology: 'E'/'P' make an AMP pair of clusters (boards with amp=True), 0 = one SMP cluster
++            ('cluster-type', u32(ord('P' if core >= b['big_from'] else 'E') if b.get('amp') else 0)),
+             ('die-cluster-id', u32(0)),
+             ('cluster-core-id', u32(core)),
+             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+@@ -258,9 +256,9 @@
+         ph(),
+         ('compatible', cstr('arm,gic-v3')),
+         ('interrupt-controller', b''),
+-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+-    ])
++        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else b.get('vtimer', VTIMER_INTID))),
++        ('reg', u64(gicd - SOC_BASE, gicd_size, gicr - SOC_BASE, gicr_size)),
++    ] + ([('redistributor-stride', u32(gicr_stride))] if gicr_stride else []))
+     arm_io = node('arm-io', [
+         ph(),
+         ('device_type', cstr('ishtar-io')),
+@@ -342,7 +340,7 @@
+         ('manufacturer', cstr('Apple Inc.')),
+         ('#address-cells', u32(2)),
+         ('#size-cells', u32(2)),
+-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
++    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or not with_ufs else [ufs]))
+ 
+ 
+ if __name__ == '__main__':
+@@ -351,8 +349,9 @@
+     points = tuple(int(v) for v in sys.argv[sys.argv.index('--points') + 1].split('x')) if '--points' in sys.argv else (375, 812)
+     lowpool = parse_lowpool(sys.argv[sys.argv.index('--lowpool') + 1]) if '--lowpool' in sys.argv else None
+     identity = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22ap'
++    mem = tuple(int(v, 16) for v in sys.argv[sys.argv.index('--mem') + 1].split(':')) if '--mem' in sys.argv else None
+     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points,
+-                 lowpool=lowpool, identity=identity)
++                 lowpool=lowpool, identity=identity, mem=mem, with_ufs='--no-ufs' not in sys.argv)
+     blob = adt.serialize(root)
+     open(sys.argv[1], 'wb').write(blob)
+     if '--dump' in sys.argv:

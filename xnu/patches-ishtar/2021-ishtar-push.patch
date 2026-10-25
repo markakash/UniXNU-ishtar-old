@@ -1,0 +1,342 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 215d785..9b4be1e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/ishtar_rpmh.c			standard
+ bsd/dev/ishtar_spmi.c			standard
+ bsd/dev/ishtar_reboot.c			standard
+ bsd/dev/ishtar_usb.c			standard
++bsd/dev/ishtar_push.c			standard
+ bsd/dev/ishtar_cpufreq.c			standard
+ bsd/dev/ishtar_charger.c			standard
+ bsd/dev/ishtar_smmu.c			standard
+diff --git a/bsd/dev/ishtar_push.c b/bsd/dev/ishtar_push.c
+new file mode 100644
+index 0000000..cc406af
+--- /dev/null
++++ b/bsd/dev/ishtar_push.c
+@@ -0,0 +1,284 @@
++/*
++ * File push over the USB Ethernet link (boot-arg ishtarpush=1, default off): a TCP server on 192.168.7.2:5141 that takes
++ * files and directories from the Mac (192.168.7.1 only, scripts/push.py) and writes them into the live iOS root, so a
++ * userspace component (the Metal plugin) can be replaced without rebuilding and reflashing userdata.
++ * Entry: "ISHP", type ('D' directory, 'F' file, 'R' remove a file, 'G' get a file, 'L' list a directory, 'X' end), 3 zero bytes, u32 mode, u32 path length, u64 data length
++ * (all little endian), the path, the data. Each entry is answered with a u32 errno. Paths must be absolute, without "..",
++ * under /System/Library/Extensions/ or /private/var/. 'G' (read) and 'L' (one "<d_type> <name>" line per entry), /private/var/ only, answer u32 errno, u64 size, the bytes.
++ * ponytail: one connection at a time, no symlinks or ownership changes; add them when a push needs them.
++ */
++#if defined(ARM64_BOARD_CONFIG_ISHTAR)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kpi_socket.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <sys/mount.h>
++#include <sys/vnode_if.h>
++#include <sys/dirent.h>
++#include <sys/uio.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <netinet/in.h>
++#include <pexpert/pexpert.h>
++
++extern int ishtar_mkdir(const char *path, int mode);    /* bsd/vfs/vfs_syscalls.c */
++extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg, enum uio_seg segflg, int unlink_flags);
++extern void IOSleep(unsigned int milliseconds);
++
++#define PUSH_CHUNK (64 * 1024)
++
++struct push_hdr {
++	char magic[4];
++	uint8_t type, pad[3];
++	uint32_t mode, path_len;
++	uint64_t size;
++} __attribute__((packed));
++
++static int
++push_recv(socket_t so, void *buf, size_t len)
++{
++	struct iovec iov = { .iov_base = buf, .iov_len = len };
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++	size_t got = 0;
++	int err = sock_receive(so, &msg, MSG_WAITALL, &got);
++	return err ? err : (got == len ? 0 : ECONNRESET);
++}
++
++static void
++push_reply(socket_t so, uint32_t err)
++{
++	struct iovec iov = { .iov_base = &err, .iov_len = sizeof(err) };
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++	size_t sent = 0;
++	(void)sock_send(so, &msg, 0, &sent);
++}
++
++static bool
++push_path_ok(const char *p)
++{
++	return (!strncmp(p, "/System/Library/Extensions/", 27) || !strncmp(p, "/private/var/", 13)) && !strnstr(p, "/..", MAXPATHLEN);
++}
++
++/* One file: data streamed to the vnode in 64 KiB pieces, then fsync. Returns errno; the stream stays in sync (the data is
++ * always read in full) unless the connection itself failed, which push_conn reports as ECONNRESET. */
++static int
++push_file(socket_t so, const char *path, uint32_t mode, uint64_t size, char *buf, bool *lost)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	for (uint64_t off = 0; off < size;) {
++		size_t n = (size_t)MIN(size - off, (uint64_t)PUSH_CHUNK);
++		if (push_recv(so, buf, n)) {
++			*lost = true;
++			err = ECONNRESET;
++			break;
++		}
++		if (!err) {
++			err = vn_rdwr(UIO_WRITE, vp, buf, (int)n, (off_t)off, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx),
++			    NULL, vfs_context_proc(ctx));
++		}
++		off += n;
++	}
++	if (vp != NULLVP) {
++		if (!err) {
++			err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
++		vnode_close(vp, FWRITE, ctx);
++	}
++	return err;
++}
++
++static void
++push_send(socket_t so, const void *data, size_t len)
++{
++	struct iovec iov = { .iov_base = (void *)(uintptr_t)data, .iov_len = len };
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++	size_t sent = 0;
++	(void)sock_send(so, &msg, 0, &sent);
++}
++
++/* 'G': errno, size, then the file in 64 KiB pieces (a short read ends it early; the size said how much to expect). */
++static void
++push_get(socket_t so, const char *path, char *buf)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	uint64_t size = 0;
++	int err = strncmp(path, "/private/var/", 13) || strnstr(path, "/..", MAXPATHLEN) ? EPERM :
++	    vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (!err) {
++		off_t sz = 0;
++		err = vnode_size(vp, &sz, ctx);
++		size = err ? 0 : (uint64_t)sz;
++	}
++	uint32_t e = (uint32_t)err;
++	push_send(so, &e, sizeof(e));
++	push_send(so, &size, sizeof(size));
++	for (uint64_t off = 0; !err && off < size;) {
++		size_t n = (size_t)MIN(size - off, (uint64_t)PUSH_CHUNK);
++		int resid = 0;
++		if (vn_rdwr(UIO_READ, vp, buf, (int)n, (off_t)off, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx)) || resid) {
++			break;
++		}
++		push_send(so, buf, n);
++		off += n;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FREAD, ctx);
++	}
++}
++
++/* 'L': the directory's entries as text, built in the second half of buf (32 KiB; a longer listing is cut there). */
++static void
++push_list(socket_t so, const char *path, char *buf)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char *text = buf + PUSH_CHUNK / 2;
++	size_t len = 0;
++	int err = strncmp(path, "/private/var/", 13) || strnstr(path, "/..", MAXPATHLEN) ? EPERM :
++	    vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	for (off_t off = 0; !err;) {
++		int eof = 0, num = 0;
++		uio_t u = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++		if (u == NULL) {
++			break;
++		}
++		uio_addiov(u, CAST_USER_ADDR_T(buf), PUSH_CHUNK / 2);
++		err = VNOP_READDIR(vp, u, 0, &eof, &num, ctx);
++		size_t got = (size_t)(PUSH_CHUNK / 2 - uio_resid(u));
++		off = uio_offset(u);
++		uio_free(u);
++		for (size_t at = 0; !err && at + __builtin_offsetof(struct dirent, d_name) <= got;) {
++			const struct dirent *d = (const struct dirent *)(buf + at);
++			if (d->d_reclen == 0) {
++				break;
++			}
++			if (d->d_ino && len + d->d_namlen + 4 < PUSH_CHUNK / 2) {
++				len += (size_t)snprintf(text + len, PUSH_CHUNK / 2 - len, "%u %.*s\n", d->d_type, d->d_namlen, d->d_name);
++			}
++			at += d->d_reclen;
++		}
++		if (err || eof || got == 0) {
++			break;
++		}
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FREAD, ctx);
++	}
++	uint32_t e = (uint32_t)err;
++	uint64_t size = err ? 0 : len;
++	push_send(so, &e, sizeof(e));
++	push_send(so, &size, sizeof(size));
++	if (size) {
++		push_send(so, text, len);
++	}
++}
++
++static void
++push_conn(socket_t so, char *buf)
++{
++	unsigned files = 0, errors = 0;
++	for (;;) {
++		struct push_hdr h;
++		char path[MAXPATHLEN];
++		bool lost = false;
++		if (push_recv(so, &h, sizeof(h)) || memcmp(h.magic, "ISHP", 4) || h.path_len >= sizeof(path)) {
++			break;
++		}
++		if (h.type == 'X') {
++			push_reply(so, 0);
++			break;
++		}
++		if (push_recv(so, path, h.path_len)) {
++			break;
++		}
++		path[h.path_len] = 0;
++		int err = push_path_ok(path) ? 0 : EPERM;
++		if (h.type == 'D') {
++			if (!err) {
++				err = ishtar_mkdir(path, h.mode & 07777);
++				err = err == EEXIST ? 0 : err;
++			}
++		} else if (h.type == 'L') {
++			push_list(so, path, buf);
++			continue;
++		} else if (h.type == 'G') {
++			push_get(so, path, buf);
++			continue;               /* push_get sent its own answer */
++		} else if (h.type == 'R') {
++			if (!err) {
++				err = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++			}
++		} else if (h.type == 'F') {
++			err = push_file(so, path, h.mode, err ? 0 : h.size, buf, &lost);
++			if (err == EPERM) {     /* refused path: drain its data so the next header lines up */
++				for (uint64_t off = 0; off < h.size && !lost; off += MIN(h.size - off, (uint64_t)PUSH_CHUNK)) {
++					lost = push_recv(so, buf, (size_t)MIN(h.size - off, (uint64_t)PUSH_CHUNK)) != 0;
++				}
++			}
++			files++;
++		} else {
++			err = EINVAL;
++		}
++		if (err) {
++			errors++;
++			printf("ISHTAR PUSH: %c %s -> errno %d\n", h.type, path, err);
++		}
++		push_reply(so, (uint32_t)err);
++		if (lost) {
++			break;
++		}
++	}
++	printf("ISHTAR PUSH: connection done, %u files, %u errors\n", files, errors);
++}
++
++static void
++push_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	socket_t ls = NULL;
++	struct sockaddr_in sin = { .sin_len = sizeof(sin), .sin_family = AF_INET, .sin_port = htons(5141) };
++	int on = 1;
++	char *buf = kalloc_data(PUSH_CHUNK, Z_WAITOK);
++
++	while (rootvnode == NULLVP) {
++		IOSleep(1000);
++	}
++	if (!buf || sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) ||
++	    sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) ||
++	    sock_bind(ls, (struct sockaddr *)&sin) || sock_listen(ls, 1)) {
++		printf("ISHTAR PUSH: no listener\n");
++		return;
++	}
++	printf("ISHTAR PUSH: listening on tcp 5141\n");
++	for (;;) {
++		socket_t so = NULL;
++		struct sockaddr_in from = {};
++		if (sock_accept(ls, (struct sockaddr *)&from, sizeof(from), 0, NULL, NULL, &so) || so == NULL) {
++			IOSleep(100);
++			continue;
++		}
++		if (from.sin_addr.s_addr == htonl(0xc0a80701)) {        /* 192.168.7.1 */
++			push_conn(so, buf);
++		}
++		sock_close(so);
++	}
++}
++
++void
++ishtar_push_start(void)
++{
++	int on = 0;
++	thread_t thread;
++	PE_parse_boot_argn("ishtarpush", &on, sizeof(on));
++	if (on && kernel_thread_start(push_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_ISHTAR */
+diff --git a/bsd/dev/ishtar_usb.c b/bsd/dev/ishtar_usb.c
+index bc16dce..996299e 100644
+--- a/bsd/dev/ishtar_usb.c
++++ b/bsd/dev/ishtar_usb.c
+@@ -1390,5 +1390,9 @@ ishtar_usb_gadget_start(vm_offset_t dwc)
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (ud.ifp != NULL) {
++		extern void ishtar_push_start(void);
++		ishtar_push_start();    /* bsd/dev/ishtar_push.c, boot-arg ishtarpush=1 */
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_ISHTAR */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index d0efb31..32a9992 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -10075,6 +10075,21 @@ mkdir_extended(proc_t p, struct mkdir_extended_args *uap, __unused int32_t *retv
+ 	return ciferror;
+ }
+ 
++
++#if defined(ARM64_BOARD_CONFIG_ISHTAR)
++/* bsd/dev/ishtar_push.c: mkdir of a kernel-space path as the kernel. */
++int ishtar_mkdir(const char *path, int mode);
++int
++ishtar_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, (mode & ACCESSPERMS));
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif
++
+ int
+ mkdir(proc_t p, struct mkdir_args *uap, __unused int32_t *retval)
+ {

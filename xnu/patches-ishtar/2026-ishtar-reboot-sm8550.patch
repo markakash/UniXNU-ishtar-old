@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/ishtar_push.c b/bsd/dev/ishtar_push.c
+index 6ee277c..a566b10 100644
+--- a/bsd/dev/ishtar_push.c
++++ b/bsd/dev/ishtar_push.c
+@@ -2,7 +2,7 @@
+  * File push over the USB Ethernet link (boot-arg ishtarpush=1, default off): a TCP server on 192.168.7.2:5141 that takes
+  * files and directories from the Mac (192.168.7.1 only, scripts/push.py) and writes them into the live iOS root, so a
+  * userspace component (the Metal plugin) can be replaced without rebuilding and reflashing userdata.
+- * Entry: "ISHP", type ('D' directory, 'F' file, 'R' remove a file, 'G' get a file, 'L' list a directory, 'S' set a knob, 'X' end), 3 zero bytes, u32 mode, u32 path length, u64 data length
++ * Entry: "ISHP", type ('D' directory, 'F' file, 'R' remove a file, 'G' get a file, 'L' list a directory, 'S' set a knob, 'B' reboot to fastboot, 'X' end), 3 zero bytes, u32 mode, u32 path length, u64 data length
+  * (all little endian), the path, the data. Each entry is answered with a u32 errno. Paths must be absolute, without "..",
+  * under /System/Library/Extensions/ or /private/var/. 'G' (read) and 'L' (one "<d_type> <name>" line per entry), /private/var/ only, answer u32 errno, u64 size, the bytes.
+  * 'S': the path is a knob name a driver registered (ishtar_knob_register), the data length its new value (answer: errno);
+@@ -28,6 +28,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern int ishtar_mkdir(const char *path, int mode);    /* bsd/vfs/vfs_syscalls.c */
++extern void ishtar_reboot_bootloader(void);              /* bsd/dev/ishtar_reboot.c */
+ extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg, enum uio_seg segflg, int unlink_flags);
+ extern void IOSleep(unsigned int milliseconds);
+ 
+@@ -226,6 +227,11 @@ push_conn(socket_t so, char *buf)
+ 			push_reply(so, 0);
+ 			break;
+ 		}
++		if (h.type == 'B') {
++			push_reply(so, 0);
++			ishtar_reboot_bootloader();
++			break;
++		}
+ 		if (push_recv(so, path, h.path_len)) {
+ 			break;
+ 		}
+diff --git a/bsd/dev/ishtar_reboot.c b/bsd/dev/ishtar_reboot.c
+index d356bff..36b0973 100644
+--- a/bsd/dev/ishtar_reboot.c
++++ b/bsd/dev/ishtar_reboot.c
+@@ -36,11 +36,18 @@
+  * Reset time may be non-preemptible (halt_all_cpus, panic): everything is
+  * mapped by ishtar_reboot_init() and the SPMI helpers run lock-less there.
+  * All logs start with "ISHTAR REBOOT:".
++ *
++ * ishtar (SM8550, not the reference board): no PS_HOLD node in the stock DT, reset is PSCI SYSTEM_RESET only.
++ * Reason (stock DT reboot_reason -> nvmem restart@48 bits <1 7> of sdam@7100, PMK8550 SID 0; qcom-reboot-reason.c
++ * bootloader 0x02, recovery 0x01): register 0x7148, written through the SPMI arbiter v7 (core 0xc400000, APID map
++ * +0x2000; observer 0xc440000, 0x20 per APID; channels 0xc500000, 0x1000 per APID; cnfg 0xc42d000 owner 4 * APID,
++ * as spmi-pmic-arb.c v7). Plus IMEM restart_reason (qcom,msm-imem@146aa000, restart_reason@65c).
+  */
+ #if defined(ARM64_BOARD_CONFIG_ISHTAR)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
++#include <sys/reboot.h>
+ #include <sys/errno.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -73,6 +80,60 @@ static int sr_override = -1;               /* sysctl; -1 = none */
+ static volatile uint32_t *sr_pshold;
+ static volatile uint32_t *sr_imem;
+ static bool sr_ready, sr_pon_ready, sr_in_panic;
++static vm_offset_t sr7_obs, sr7_chnl;      /* SM8550: SDAM peripheral's observer and RW channel */
++
++#define SR7_SDAM_PPID    0x071u            /* SID 0, peripheral 0x71 (sdam@7100) */
++#define SR7_REASON_ADDR  0x48u             /* restart@48 */
++
++/* One SPMI command on a v7 channel (cmd at +0, status +8, wdata0 +0x10, rdata0 +0x18). opc 1 = EXT_READL, 0 = EXT_WRITEL. */
++static bool
++sr7_cmd(vm_offset_t ch, unsigned opc, uint8_t *val)
++{
++	if (opc == 0) {
++		*(volatile uint32_t *)(ch + 0x10) = *val;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)ch = (opc << 27) | (SR7_REASON_ADDR << 4);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08);
++		if (st & 1u) {
++			if (opc == 1) {
++				*val = (uint8_t)*(volatile uint32_t *)(ch + 0x18);
++			}
++			return !(st & 0x0eu);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++sr7_init(void)
++{
++	volatile uint32_t *core = (volatile uint32_t *)ml_io_map(0x0c400000u, 0x3000);
++	volatile uint32_t *cnfg = (volatile uint32_t *)ml_io_map(0x0c42d000u, 0x4000);
++	unsigned count = core ? core[1] & 0x7ffu : 0, apid = 0, owner = 7;
++	for (; apid < count && apid < 1024; apid++) {
++		uint32_t map = core[0x2000 / 4 + apid];
++		if (map && ((map >> 8) & 0xfffu) == SR7_SDAM_PPID) {
++			break;
++		}
++	}
++	if (apid < count && cnfg) {
++		owner = cnfg[apid] & 7u;
++	}
++	if (owner == 0) {
++		sr7_obs = ml_io_map(0x0c440000u, 0x8000);
++		sr7_chnl = ml_io_map(0x0c500000u + 0x1000u * apid, 0x1000);
++		sr_pon_ready = sr7_obs && sr7_chnl;
++		sr7_obs += 0x20u * apid;
++	}
++	sr_imem = (volatile uint32_t *)ml_io_map(0x146aa000u, 0x1000);
++	sr_ready = true;
++	printf("ISHTAR REBOOT: sm8550 arb apids %u, sdam apid %u owner %u, reason %s, IMEM %s, reset PSCI\n",
++	    count, apid, owner, sr_pon_ready ? "writable" : "unavailable", sr_imem ? "mapped" : "NOT mapped");
++}
+ 
+ static const char *
+ sr_name(int mode)
+@@ -144,7 +205,7 @@ ishtar_reboot_init(void)
+ {
+ 	char arg[16] = "";
+ 
+-	if (sr_ready || !ishtar_board_ref()) {
++	if (sr_ready) {
+ 		return;
+ 	}
+ 	if (PE_parse_boot_argn("ishtarreboot", arg, sizeof(arg))) {
+@@ -155,6 +216,10 @@ ishtar_reboot_init(void)
+ 			sr_bootarg = mode;
+ 		}
+ 	}
++	if (!ishtar_board_ref()) {
++		sr7_init();
++		return;
++	}
+ 	sr_pshold = (volatile uint32_t *)ml_io_map(SR_PSHOLD_PA, 0x1000);
+ 	sr_imem = (volatile uint32_t *)ml_io_map(SR_IMEM_PA, 0x1000);
+ 	if (ishtar_spmi_init() == 0 && ishtar_spmi_prepare_write(SR_PON_SID, SR_PON_SPARE) == 0) {
+@@ -179,6 +244,16 @@ sr_pon_set_reason(unsigned magic)
+ 		printf("ISHTAR REBOOT: PON spare not writable, reason not stored\n");
+ 		return;
+ 	}
++	if (sr7_chnl) {
++		bool rok = sr7_cmd(sr7_obs, 1, &old), wok = false;
++		upd = (uint8_t)((old & ~SR_REASON_MASK) | ((magic << SR_REASON_SHIFT) & SR_REASON_MASK));
++		if (rok) {
++			wok = sr7_cmd(sr7_chnl, 0, &upd);
++			(void)sr7_cmd(sr7_obs, 1, &back);
++		}
++		printf("ISHTAR REBOOT: SDAM 0x7148 read %d 0x%02x -> 0x%02x write %d (read back 0x%02x)\n", rok, old, upd, wok, back);
++		return;
++	}
+ 	if (ishtar_spmi_read(SR_PON_SID, SR_PON_SPARE, &old) != 0) {
+ 		printf("ISHTAR REBOOT: PON spare read failed, reason not stored\n");
+ 		return;
+@@ -242,7 +317,13 @@ ishtar_reboot_restart(int panic_restart)
+ 		    mode == SR_RECOVERY ? SR_IMEM_RECOVERY : SR_IMEM_ISHTAR;
+ 		sr_imem[SR_IMEM_RESTART / 4] = magic;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("ISHTAR REBOOT: IMEM restart_reason 0x146bf65c = 0x%08x\n", magic);
++		printf("ISHTAR REBOOT: IMEM restart_reason +0x65c = 0x%08x\n", magic);
++	}
++	if (!sr_pshold) {
++		delay(100 * 1000);      /* let the log reach the Mac */
++		sr_psci_system_reset();
++		delay(2000 * 1000);
++		return -1;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	*sr_pshold = 0;
+@@ -253,4 +334,12 @@ ishtar_reboot_restart(int panic_restart)
+ 	delay(2000 * 1000);
+ 	return -1;
+ }
++/* scripts/push.py --reboot-bootloader: sync, unmount, reset into fastboot (normal kernel reboot path). */
++void
++ishtar_reboot_bootloader(void)
++{
++	sr_override = SR_BOOTLOADER;
++	printf("ISHTAR REBOOT: reboot to bootloader requested over USB\n");
++	(void)reboot_kernel(RB_AUTOBOOT, NULL);
++}
+ #endif /* ARM64_BOARD_CONFIG_ISHTAR */

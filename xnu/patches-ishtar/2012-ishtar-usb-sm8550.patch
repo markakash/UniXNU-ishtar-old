@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/ishtar_smmu.c b/bsd/dev/ishtar_smmu.c
+index ce39caf..88e6ace 100644
+--- a/bsd/dev/ishtar_smmu.c
++++ b/bsd/dev/ishtar_smmu.c
+@@ -103,7 +103,7 @@ smmu_bank_create(void)
+ 		return ENODEV;
+ 	}
+ 
+-	/* identity map DRAM 0x80000000..0x27fffffff, level-1 1 GiB blocks, Normal NC, RW */
++	/* identity map DRAM 0x80000000..0xfffffffff, level-1 1 GiB blocks, Normal NC, RW */
+ 	vm_offset_t l1v = 0;
+ 	if (kmem_alloc_contig(kernel_map, &l1v, L1_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -118,7 +118,7 @@ smmu_bank_create(void)
+ 	}
+ 	uint64_t l1_pa = ptoa_64(pn);
+ 	volatile uint64_t *l1 = (volatile uint64_t *)l1v;
+-	for (unsigned i = 2; i < 10; i++) {
++	for (unsigned i = 2; i < 64; i++) {      /* ishtar: RAM reaches 0x9xxxxxxxx, map 2..64 GiB */
+ 		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
+ 	}
+ 	/*
+diff --git a/bsd/dev/ishtar_usb.c b/bsd/dev/ishtar_usb.c
+index 64ca35a..bc16dce 100644
+--- a/bsd/dev/ishtar_usb.c
++++ b/bsd/dev/ishtar_usb.c
+@@ -54,20 +54,21 @@ extern int ishtar_net_publish(const char *bsd_name, const char *prefix, unsigned
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define GCC_USB30_PRIM_GDSCR    0x39004         /* bit 31: power on (ishtar SM8550, Linux gcc-sm8550.c) */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	/* ishtar (SM8550): Linux gcc-sm8550.c halt_reg; [5] is the PHY aux clock (eUSB2 PHY, no QUSB2/ahb2phy) */
++	{ "master", 0x39018 },
++	{ "sleep", 0x39024 },
++	{ "utmi", 0x39028 },
++	{ "cfg-noc-axi", 0x39088 },
++	{ "aggre-axi", 0x3908c },
++	{ "phy-aux", 0x39060 },
++	{ "phy-pipe", 0x39068 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -83,6 +84,19 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/* ishtar: ishtarusbhold=N seconds on screen for the lines above. */
++static int usb_smmu_state = -1;        /* ishtar_smmu_probe_sid(0x40): 0 unmatched, 1 bypass, 2 translate, 3 fault */
++
++static void
++usb_probe_tail(void)
++{
++	int hold = 0;
++	if (PE_parse_boot_argn("ishtarusbhold", &hold, sizeof(hold)) && hold > 0 && hold <= 120) {
++		printf("ISHTAR USB: holding %d s for the camera\n", hold);
++		delay(hold * 1000000);
++	}
++}
++
+ void
+ ishtar_usb_probe(void)
+ {
+@@ -111,6 +125,7 @@ ishtar_usb_probe(void)
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+ 	if (!clocks_on) {
+ 		printf("ISHTAR USB: controller unpowered or unclocked; DWC3 not read\n");
++		usb_probe_tail();
+ 		return;
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+@@ -126,9 +141,17 @@ ishtar_usb_probe(void)
+ 	printf("ISHTAR USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	/* ishtar: SMMU state of the USB (0x40) and GPI DMA (0x436, touch SPI) streams; 0x40 decides the auto map */
++	extern int ishtar_smmu_probe_sid(unsigned sid, unsigned level);
++	usb_smmu_state = ishtar_smmu_probe_sid(0x40, 2);
++	(void)ishtar_smmu_probe_sid(0x436, 2);
+ 	if (enabled >= 2) {
+ 		ishtar_usb_gadget_start(dwc);
+ 	}
++	usb_probe_tail();
++	if (!ishtar_board_ref()) {
++		return;         /* ishtar: eUSB2 PHY, the QUSB2 read below is the upstream board's */
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("ISHTAR USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -1286,6 +1309,26 @@ ishtar_usb_gadget_start(vm_offset_t dwc)
+ 		/* apps_smmu stream 0x740: the first DMA would fault and reset the SoC */
+ 		int se = ishtar_smmu_map_sid(0x740);
+ 		printf("ISHTAR USB: apps_smmu sid 0x740 -> %d\n", se);
++	} else {
++		/*
++		 * ishtar (SM8550, DWC3 3.x, USB 3.2-capable): ishtarusbg1=1 (default) sets GUCTL1.DEV_FORCE_20_CLK_FOR_30_CLK
++		 * so the USB3 logic runs from the USB2 clock whatever the QMP PHY does. ishtarusbsmmu: -1 (default) maps stream
++		 * 0x40 (stock DT iommus) to the identity bank when the probe found no SMR or a fault entry, 0 never, 1 always.
++		 */
++		int g1 = 1, sm = -1;
++		PE_parse_boot_argn("ishtarusbg1", &g1, sizeof(g1));
++		PE_parse_boot_argn("ishtarusbsmmu", &sm, sizeof(sm));
++		if (g1) {
++			uint32_t guctl1 = dwc_rd(0xc11c);
++			dwc_wr(0xc11c, guctl1 | (1u << 26));
++			printf("ISHTAR USB: GUCTL1 0x%08x -> 0x%08x\n", guctl1, dwc_rd(0xc11c));
++		}
++		if (sm < 0) {
++			sm = usb_smmu_state == 0 || usb_smmu_state == 3;
++		}
++		if (sm) {
++			printf("ISHTAR USB: apps_smmu sid 0x40 -> %d\n", ishtar_smmu_map_sid(0x40));
++		}
+ 	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));

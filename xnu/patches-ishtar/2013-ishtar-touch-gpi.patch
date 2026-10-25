@@ -1,0 +1,371 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index 042725c..7621c93 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -26,6 +26,10 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "ishtar_board.h"
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -1366,8 +1370,11 @@ geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
+  * CS0, <= 12 MHz from DFS level 0), reset GPIO 117 pulse, then the chip ID (HW register read 0xFB + 0x20000000,
+  * one dummy byte; expect 0x36 0x48/0x50/0x40/0x39) and one FIFO event (0x87, one dummy byte). Reads only on the IC.
+  */
++static int gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div);
++static int gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n);
++
+ static void
+-ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm)
++ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+ {
+ 	vm_offset_t se = ml_io_map(0x00880000u, 0x4000);
+ 	uint32_t cfg = *(volatile uint32_t *)(gcc + 0x1e010 + 0x1c), m = *(volatile uint32_t *)(gcc + 0x1e010 + 0x5c),
+@@ -1408,13 +1415,17 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm)
+ 	printf("ISHTAR TOUCHPROBE: SE8 fifo depth tx %u rx %u ifdis %#x hw0 %#x hw1 %#x hw2 %#x dmacfg %#x\n", txd, rxd,
+ 	    *(volatile uint32_t *)(se + 0x64), *(volatile uint32_t *)(se + 0xe24), *(volatile uint32_t *)(se + 0xe28),
+ 	    *(volatile uint32_t *)(se + 0xe2c), *(volatile uint32_t *)(se + 0xe30));
+-	if (*(volatile uint32_t *)(se + 0x64) & 1u) {
+-		printf("ISHTAR TOUCHPROBE: SE8 FIFO interface disabled (GSI-only engine): FIFO transfers skipped\n");
++	bool gsi = *(volatile uint32_t *)(se + 0x64) & 1u;
++	if (gsi && (fts_stage < 6 || gpi_spi_up(gcc, se, div))) {
++		printf("ISHTAR TOUCHPROBE: SE8 FIFO interface disabled (GSI-only engine)%s\n",
++		    fts_stage < 6 ? ": FIFO transfers skipped" : ", GPI setup failed");
+ 		return;
+ 	}
+-	geni_w(se, 0x80c, 0);
+-	geni_w(se, 0x618, 0xffffffffu);
+-	geni_w(se, 0x614, 0x40007e3fu);
++	if (!gsi) {
++		geni_w(se, 0x80c, 0);
++		geni_w(se, 0x618, 0xffffffffu);
++		geni_w(se, 0x614, 0x40007e3fu);
++	}
+ 	vm_offset_t rst = tlmm + 117 * 0x1000u;
+ 	geni_w(rst, 4, 0);
+ 	geni_w(rst, 0, 0x200);                  /* reset low, output */
+@@ -1423,15 +1434,271 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm)
+ 	delay(200000);
+ 	static const uint8_t id_tx[8] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };
+ 	uint8_t rx[16] = { 0 };
+-	int rc = geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
++	int rc = gsi ? gpi_spi_xfer(id_tx, rx, sizeof(id_tx)) : geni_spi_xfer(se, id_tx, rx, sizeof(id_tx));
+ 	printf("ISHTAR TOUCHPROBE: fts chip id rc %d: %02x %02x %02x (dummy, id0, id1; expect 36 4x/5x/39)\n", rc,
+ 	    rx[5], rx[6], rx[7]);
+ 	static const uint8_t ev_tx[10] = { 0x87 };
+-	rc = geni_spi_xfer(se, ev_tx, rx, sizeof(ev_tx));
++	rc = gsi ? gpi_spi_xfer(ev_tx, rx, sizeof(ev_tx)) : geni_spi_xfer(se, ev_tx, rx, sizeof(ev_tx));
+ 	printf("ISHTAR TOUCHPROBE: fts event rc %d: %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", rc, rx[1], rx[2],
+ 	    rx[3], rx[4], rx[5], rx[6], rx[7], rx[8], rx[9]);
+ }
+ 
++/*
++ * Stage 6: SE8 is GSI-only (GENI_IF_DISABLE_RO = 1), so SPI goes through the GPI DMA engine gpi_dma2 @0x800000
++ * (stock DT; SMMU stream 0x436; HLOS GPIIs = mask 0x3e, GPII 1 used). Polled: command completion = the channel
++ * state in CNTXT_0, transfer completion = an event in the event ring. Layout and TRE encoding from Linux v6.12
++ * drivers/dma/qcom/gpi.c and drivers/spi/spi-geni-qcom.c (setup_gsi_xfer). One contiguous DMA block, IOVA == PA.
++ */
++#define GPI_PA          0x00800000u
++static uint32_t gpi_gpii = 1;   /* boot-arg ishtartouchgpii=N; -1 (default) only scans GPIIs 0-11, read only */
++#define GPI_GPII        gpi_gpii
++#define GPI_N(off)      ((off) - 0x10000u + 0x4000u * GPI_GPII)  /* SM8550 = sm6350-gpi-dma: ee_offset 0x10000 */
++#define GPI_CH(k)       GPI_N(0x20000u + 0x80u * (k))       /* channel k context */
++#define GPI_CH_DB(k)    GPI_N(0x22000u + 0x8u * (k))
++#define GPI_EV          GPI_N(0x21000u)                     /* event ring 0 context */
++#define GPI_EV_DB       GPI_N(0x22100u)
++#define GPI_CH_CMD      GPI_N(0x23008u)
++#define GPI_EV_CMD      GPI_N(0x23010u)
++#define GPI_RING_EL     16u
++#define GPI_CH_ELS      64u
++#define GPI_EV_ELS      256u
++/* DMA block: event ring 4 KiB, TX ring 1 KiB, RX ring 1 KiB, TX buffer, RX buffer */
++#define GD_EV           0x0000u
++#define GD_TX           0x1000u
++#define GD_RX           0x1400u
++#define GD_TXBUF        0x1800u
++#define GD_RXBUF        0x1c00u
++#define GD_SIZE         0x4000u
++
++static uint32_t tp_pace_ms;     /* ishtartouchdefer: pause after each step so the USB live log gets it out */
++
++static void
++tp_step(const char *what)
++{
++	printf("ISHTAR TOUCHPROBE: step %s\n", what);
++	if (tp_pace_ms) {
++		delay(tp_pace_ms * 1000);
++	}
++}
++
++static struct {
++	vm_offset_t gpi, se, dma;
++	uint64_t pa;
++	uint32_t tx_wp, rx_wp, ev_rp;           /* ring element indices */
++	uint32_t div;
++	bool up;
++} gd;
++
++static uint32_t
++gpi_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(gd.gpi + off);
++}
++
++static void
++gpi_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gd.gpi + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Waits for a context's CHSTATE (bits 23:20) to become want; returns the last CNTXT_0. */
++static uint32_t
++gpi_wait_state(uint32_t ctx, uint32_t want)
++{
++	uint32_t v = 0;
++	for (int i = 0; i < 2500; i++) {          /* 250 ms, Linux CMD_TIMEOUT_MS */
++		v = gpi_rd(ctx);
++		if (((v >> 20) & 0xf) == want) {
++			break;
++		}
++		delay(100);
++	}
++	gpi_wr(GPI_N(0x230a0u), 0x3);           /* SRC_CH_IRQ_CLR */
++	gpi_wr(GPI_N(0x230a4u), 0x1);           /* SRC_EV_CH_IRQ_CLR */
++	return v;
++}
++
++static void
++gpi_ring_ctx(uint32_t ctx, uint32_t db, uint32_t cfg, uint32_t off, uint32_t els)
++{
++	gpi_wr(ctx + 0x0, cfg);
++	gpi_wr(ctx + 0x4, els * GPI_RING_EL);
++	gpi_wr(ctx + 0x8, (uint32_t)(gd.pa + off));
++	gpi_wr(ctx + 0xc, (uint32_t)((gd.pa + off) >> 32));
++	gpi_wr(db + 4, (uint32_t)((gd.pa + off) >> 32));   /* doorbell MSB */
++}
++
++static int
++gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div)
++{
++	extern int ishtar_smmu_probe_sid(unsigned sid, unsigned level);
++	extern int ishtar_smmu_map_sid(unsigned sid);
++	int sm = -1, st = ishtar_smmu_probe_sid(0x436, 1);
++	(void)gcc;
++	PE_parse_boot_argn("ishtartouchsmmu", &sm, sizeof(sm));
++	if (sm < 0) {
++		sm = st == 0 || st == 3;
++	}
++	printf("ISHTAR TOUCHPROBE: stage 6: smmu probe 0x436 = %d, map %d\n", st, sm);
++	tp_step("smmu map");
++	if (sm) {
++		printf("ISHTAR TOUCHPROBE: stage 6: apps_smmu sid 0x436 -> %d\n", ishtar_smmu_map_sid(0x436));
++	}
++	tp_step("gpi map + first read");
++	gd.gpi = ml_io_map(GPI_PA, 0x60000);
++	gd.se = se;
++	gd.div = div;
++	int want = -1;
++	PE_parse_boot_argn("ishtartouchgpii", &want, sizeof(want));
++	if (gd.gpi && (want < 1 || want > 5)) {
++		/* read-only scan: owned GPIIs read sane values, protected ones read junk; then stop */
++		for (uint32_t n = 0; n < 6; n++) {     /* reading GPII 6+ resets the SoC (not HLOS) */
++			gpi_gpii = n;
++			printf("ISHTAR TOUCHPROBE: gpii %u ch0 %#x ch1 %#x ev %#x glob %#x type %#x err %#x scr %#x/%#x\n", n,
++			    gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(1)), gpi_rd(GPI_EV), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)),
++			    gpi_rd(GPI_N(0x23200u)), gpi_rd(GPI_N(0x23400u)), gpi_rd(GPI_N(0x23404u)));
++			if (tp_pace_ms) {
++				delay(100000);
++			}
++		}
++		printf("ISHTAR TOUCHPROBE: gpii scan done (ishtartouchgpii=N to use one)\n");
++		return -1;
++	}
++	gpi_gpii = (uint32_t)want;
++	if (!gd.gpi || kmem_alloc_contig(kernel_map, &gd.dma, GD_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return -1;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gd.dma);
++	if (!pn) {
++		return -1;
++	}
++	gd.pa = ptoa_64(pn);
++	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
++	printf("ISHTAR TOUCHPROBE: stage 6: GPII %u ch0 %#x ch1 %#x ev %#x, DMA %#llx\n", GPI_GPII, gpi_rd(GPI_CH(0)),
++	    gpi_rd(GPI_CH(1)), gpi_rd(GPI_EV), gd.pa);
++	tp_step("SE8 gsi mode");
++	/* SE8 into GSI mode (geni_se_select_gpi_mode) */
++	geni_w(se, 0x618, 0xffffffffu);
++	geni_w(se, 0xe1c, 0);                                   /* SE_IRQ_EN */
++	geni_w(se, 0x614, *(volatile uint32_t *)(se + 0x614) & ~((1u << 0) | (1u << 30) | (1u << 26) | (1u << 27)));
++	geni_w(se, 0x258, 1);                                   /* DMA mode */
++	geni_w(se, 0xe18, *(volatile uint32_t *)(se + 0xe18) | 0xf);   /* GSI events */
++	tp_step("event ring allocate");
++	/* event ring: ALLOCATE, context (el 16, IRQ type, GPI_EV), all elements given to the engine */
++	printf("ISHTAR TOUCHPROBE: gpii %u glob-stts %#x gpii-stts %#x type-irq %#x err %#x scratch %#x/%#x\n", GPI_GPII,
++	    gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23118u)), gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23200u)),
++	    gpi_rd(GPI_N(0x23400u)), gpi_rd(GPI_N(0x23404u)));
++	/* Linux gpi_config_interrupts(DEFAULT_IRQ_SETTINGS) runs before the first command */
++	tp_step("irq config");
++	gpi_wr(GPI_N(0x23088u), 0x4f);         /* TYPE_IRQ_MSK: general, IEOB, glob, ev ctrl, ch ctrl */
++	gpi_wr(GPI_N(0x230b8u), 0x1);          /* SRC_IEOB_IRQ_MSK */
++	gpi_wr(GPI_N(0x23098u), 0x3);          /* SRC_CH_IRQ_MSK */
++	gpi_wr(GPI_N(0x2309cu), 0x1);          /* SRC_EV_CH_IRQ_MSK */
++	gpi_wr(GPI_N(0x23108u), 0xf);          /* GLOB_IRQ_EN */
++	gpi_wr(GPI_N(0x23120u), 0xf);          /* GPII_IRQ_EN */
++	gpi_wr(GPI_N(0x23180u), 0x1);          /* INTSET: IRQ (not MSI) */
++	tp_step("ev cmd write");
++	gpi_wr(GPI_EV_CMD, 0u << 24);
++	tp_step("ev cmd written, wait");
++	uint32_t v = gpi_wait_state(GPI_EV, 1);
++	printf("ISHTAR TOUCHPROBE: ev state %#x type-irq %#x\n", v, gpi_rd(GPI_N(0x23080u)));
++	tp_step("ev ctx");
++	gpi_ring_ctx(GPI_EV, GPI_EV_DB, (GPI_RING_EL << 24) | (1u << 16) | 0x2u, GD_EV, GPI_EV_ELS);
++	for (uint32_t o = 0x20; o <= 0x34; o += 4) {
++		gpi_wr(GPI_EV + o, 0);
++	}
++	gd.ev_rp = 0;
++	tp_step("ev doorbell");
++	gpi_wr(GPI_EV_DB, (uint32_t)(gd.pa + GD_EV + (GPI_EV_ELS - 1) * GPI_RING_EL));
++	/* channels: TX 0 (dir out), RX 1 (dir in), proto GPI, event ring 0; scratch = pair, SPI (1), SE 0 */
++	tp_step("channels allocate");
++	uint32_t c[2];
++	for (uint32_t k = 0; k < 2; k++) {
++		gpi_wr(GPI_CH_CMD, (0u << 24) | k);
++		c[k] = gpi_wait_state(GPI_CH(k), 1);
++		gpi_ring_ctx(GPI_CH(k), GPI_CH_DB(k), (GPI_RING_EL << 24) | ((k == 0 ? 1u : 0u) << 3) | 0x2u,
++		    k == 0 ? GD_TX : GD_RX, GPI_CH_ELS);
++		gpi_wr(GPI_N(0x20060u + 0x80u * k), ((1u - k) << 16) | (1u << 4) | 0u);
++		gpi_wr(GPI_N(0x20064u + 0x80u * k), 0);
++		gpi_wr(GPI_N(0x20068u + 0x80u * k), 0);
++		gpi_wr(GPI_N(0x2006cu + 0x80u * k), 0);
++		gpi_wr(GPI_N(0x2005cu + 0x80u * k), 1);             /* QOS */
++	}
++	uint32_t s0, s1;
++	tp_step("channels start");
++	gpi_wr(GPI_CH_CMD, (1u << 24) | 0);
++	s0 = gpi_wait_state(GPI_CH(0), 2);
++	gpi_wr(GPI_CH_CMD, (1u << 24) | 1);
++	s1 = gpi_wait_state(GPI_CH(1), 2);
++	printf("ISHTAR TOUCHPROBE: stage 6: ev alloc %#x, ch alloc %#x/%#x, started %#x/%#x (state 23:20: 1 alloc, 2 started)\n",
++	    v, c[0], c[1], s0, s1);
++	gd.tx_wp = gd.rx_wp = 0;
++	gd.up = ((s0 >> 20) & 0xf) == 2 && ((s1 >> 20) & 0xf) == 2;
++	return gd.up ? 0 : -1;
++}
++
++static void
++gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(gd.dma + ring + (*wp % GPI_CH_ELS) * GPI_RING_EL);
++	t[0] = d0; t[1] = d1; t[2] = d2; t[3] = d3;
++	(*wp)++;
++}
++
++/* Full-duplex SPI of n bytes (<= 1 KiB) through GPI: TX = CONFIG0 + GO(DUPLEX) + DMA, RX = DMA. */
++static int
++gpi_spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
++{
++	if (!gd.up || n > 0x400) {
++		return -1;
++	}
++	memcpy((void *)(gd.dma + GD_TXBUF), tx, n);
++	bzero((void *)(gd.dma + GD_RXBUF), n);
++	uint64_t txb = gd.pa + GD_TXBUF, rxb = gd.pa + GD_RXBUF;
++	gpi_tre(GD_RX, &gd.rx_wp, (uint32_t)rxb, (uint32_t)(rxb >> 32), n, (0x10u << 16) | (1u << 9));
++	gpi_tre(GD_TX, &gd.tx_wp, 4u | (1u << 24) | (1u << 25), 0, gd.div | (0u << 16), (0x22u << 16) | 1u);
++	gpi_tre(GD_TX, &gd.tx_wp, 3u | (0u << 8), 0, n, (0x20u << 16) | 1u | (1u << 11));
++	gpi_tre(GD_TX, &gd.tx_wp, (uint32_t)txb, (uint32_t)(txb >> 32), n, (0x10u << 16) | (1u << 9));
++	ishtar_dma_sync_va((const void *)gd.dma, GD_SIZE);
++	tp_step("rx doorbell");
++	gpi_wr(GPI_CH_DB(1), (uint32_t)(gd.pa + GD_RX + (gd.rx_wp % GPI_CH_ELS) * GPI_RING_EL));
++	tp_step("rx doorbell written");
++	printf("ISHTAR TOUCHPROBE: after rx db: ch1 %#x rp %#x glob %#x type %#x err %#x\n", gpi_rd(GPI_CH(1)),
++	    gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)), gpi_rd(GPI_N(0x23200u)));
++	tp_step("tx doorbell");
++	gpi_wr(GPI_CH_DB(0), (uint32_t)(gd.pa + GD_TX + (gd.tx_wp % GPI_CH_ELS) * GPI_RING_EL));
++	tp_step("tx doorbell written");
++	printf("ISHTAR TOUCHPROBE: after tx db: ch0 %#x rp %#x ch1 rp %#x glob %#x type %#x\n", gpi_rd(GPI_CH(0)),
++	    gpi_rd(GPI_CH(0) + 0x10), gpi_rd(GPI_CH(1) + 0x10), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23080u)));
++	/* wait for two completion events (TX and RX end of transfer) */
++	int got = 0;
++	uint32_t ev[4] = { 0 };
++	for (int i = 0; i < 2000 && got < 2; i++) {     /* 200 ms */
++		ishtar_dma_sync_va((const void *)(gd.dma + GD_EV), GPI_EV_ELS * GPI_RING_EL);
++		volatile uint32_t *e = (volatile uint32_t *)(gd.dma + GD_EV + (gd.ev_rp % GPI_EV_ELS) * GPI_RING_EL);
++		if (e[3] != 0) {
++			ev[0] = e[0]; ev[1] = e[1]; ev[2] = e[2]; ev[3] = e[3];
++			e[0] = e[1] = e[2] = e[3] = 0;
++			gd.ev_rp++;
++			got++;
++			continue;
++		}
++		delay(100);
++	}
++	/* give the consumed events back */
++	gpi_wr(GPI_EV_DB, (uint32_t)(gd.pa + GD_EV + ((gd.ev_rp + GPI_EV_ELS - 1) % GPI_EV_ELS) * GPI_RING_EL));
++	ishtar_dma_sync_va((const void *)(gd.dma + GD_RXBUF), n);
++	memcpy(rx, (const void *)(gd.dma + GD_RXBUF), n);
++	if (got < 2) {
++		printf("ISHTAR TOUCHPROBE: gpi xfer: %d events, last %08x %08x %08x %08x, ch0 %#x ch1 %#x glob %#x err %#x\n", got,
++		    ev[0], ev[1], ev[2], ev[3], gpi_rd(GPI_CH(0)), gpi_rd(GPI_CH(1)), gpi_rd(GPI_N(0x23100u)), gpi_rd(GPI_N(0x23200u)));
++		return -1;
++	}
++	return 0;
++}
++
+ static void
+ ishtar_touch_probe(int stage)
+ {
+@@ -1494,7 +1761,7 @@ ishtar_touch_probe(int stage)
+ 		printf("ISHTAR TOUCHPROBE: hub SE2 clocks not all on, engine not read\n");
+ 	}
+ 	if (stage >= 5 && (on & 0x1fu) == 0x1fu && tlmm) {
+-		ishtar_touch_fts_probe(gcc, tlmm);
++		ishtar_touch_fts_probe(gcc, tlmm, stage);
+ 	}
+ 	/* SE clock sources: CMD_RCGR, CFG_RCGR, DFSR (bit 0 DFS on, 4:1 level) */
+ 	printf("ISHTAR TOUCHPROBE: rcg s0 %#x/%#x/%#x hub-s2 %#x/%#x/%#x\n",
+@@ -1507,6 +1774,20 @@ ishtar_touch_probe(int stage)
+ 	}
+ }
+ 
++static void
++ishtar_touch_probe_thread(void *arg, wait_result_t wr __unused)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline((uint32_t)(uintptr_t)arg, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&tp_pace_ms, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	int stage = 1;
++	(void)PE_parse_boot_argn("ishtartouchstage", &stage, sizeof(stage));
++	printf("ISHTAR TOUCHPROBE: deferred probe, stage %d\n", stage);
++	ishtar_touch_probe(stage);
++	printf("ISHTAR TOUCHPROBE: deferred probe done\n");
++}
++
+ void
+ ishtar_touch_init(void)
+ {
+@@ -1517,7 +1798,14 @@ ishtar_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	int probe = 0;
+-	if (PE_parse_boot_argn("ishtartouchprobe", &probe, sizeof(probe)) && probe) {
++	int defer = 0;
++	(void)PE_parse_boot_argn("ishtartouchdefer", &defer, sizeof(defer));
++	if (PE_parse_boot_argn("ishtartouchprobe", &probe, sizeof(probe)) && probe && defer > 0 && defer <= 300) {
++		/* ishtartouchdefer=N: run the probe N s later on its own thread (USB and its live log are up by then) */
++		tp_pace_ms = 300;
++		(void)kernel_thread_start(ishtar_touch_probe_thread, (void *)(uintptr_t)defer, &thread);
++		thread_deallocate(thread);
++	} else if (PE_parse_boot_argn("ishtartouchprobe", &probe, sizeof(probe)) && probe) {
+ 		int stage = 1;
+ 		(void)PE_parse_boot_argn("ishtartouchstage", &stage, sizeof(stage));
+ 		ishtar_touch_probe(stage);

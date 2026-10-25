@@ -1,0 +1,230 @@
+diff --git a/bsd/dev/ishtar_touch.c b/bsd/dev/ishtar_touch.c
+index e76c335..4bd6078 100644
+--- a/bsd/dev/ishtar_touch.c
++++ b/bsd/dev/ishtar_touch.c
+@@ -1371,6 +1371,7 @@ geni_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, uint32_t n)
+  * one dummy byte; expect 0x36 0x48/0x50/0x40/0x39) and one FIFO event (0x87, one dummy byte). Reads only on the IC.
+  */
+ static int gpi_spi_up(vm_offset_t gcc, vm_offset_t se, uint32_t div);
++static void touch_power_cycle(vm_offset_t tlmm);
+ static void gpi_tre(uint32_t ring, uint32_t *wp, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3);
+ static int gpi_spi_xfer2(const uint8_t *tx, uint32_t ntx, uint8_t *rx, uint32_t nrx);
+ static bool gpi_loop;   /* SE loopback (CONFIG0 flag bit 0), full duplex of ntx bytes: data-path self test */
+@@ -1428,12 +1429,7 @@ ishtar_touch_fts_probe(vm_offset_t gcc, vm_offset_t tlmm, int fts_stage)
+ 		geni_w(se, 0x618, 0xffffffffu);
+ 		geni_w(se, 0x614, 0x40007e3fu);
+ 	}
+-	vm_offset_t rst = tlmm + 117 * 0x1000u;
+-	geni_w(rst, 4, 0);
+-	geni_w(rst, 0, 0x200);                  /* reset low, output */
+-	delay(10000);
+-	geni_w(rst, 4, 2);                      /* release */
+-	delay(200000);
++	touch_power_cycle(tlmm);
+ 	static const uint8_t id_tx[8] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };
+ 	uint8_t rx[16] = { 0 };
+ 	int rc;
+@@ -1568,74 +1564,154 @@ gpi_ring_ctx(uint32_t ctx, uint32_t db, uint32_t cfg, uint32_t off, uint32_t els
+  * +0xd00, ACTIVE TCS 0..2), cmd-db at 0x81c60000. Our TCS IRQ stays masked; polled.
+  * ponytail: fixed vote of 1 unit per BCM, real bandwidth math (cmd-db aux) when needed.
+  */
+-static void
+-touch_bcm_votes(void)
++static vm_offset_t rh8_tcs, rh8_db;
++
++/* cmd-db address of resource name on slave type (4 VRM, 5 BCM), 0 if absent */
++static uint32_t
++rh8_lookup(const char *name, uint32_t slave)
+ {
+-	static const char *const names[] = { "QUP2", "SN3", "SN0", "SH0", "MC0" };
+-	uint32_t addr[5], n = 0, v = 1;
+-	vm_offset_t rsc = ml_io_map(0x17a20000u, 0x4000), db = ml_io_map(0x81c60000u, 0x20000);
+-	if (!rsc || !db) {
+-		return;
+-	}
+-	vm_offset_t tcs = rsc + 0xd00;
+-	PE_parse_boot_argn("ishtartouchbcmv", &v, sizeof(v));
+-	printf("ISHTAR TOUCHPROBE: rpmh id %#x cfg %#x cmd-db magic %#x\n", touch_rd(rsc, 0), touch_rd(rsc, 0xc), touch_rd(db, 4));
+-	if (touch_rd(db, 4) != 0x0c0330dbu || ((touch_rd(rsc, 0) >> 16) & 0xff) != 3) {
+-		return;
+-	}
+-	for (uint32_t k = 0; k < 5; k++) {
+-		uint32_t key0 = 0, key1 = 0;
+-		for (uint32_t i = 0; names[k][i]; i++) {
+-			*(i < 4 ? &key0 : &key1) |= (uint32_t)(uint8_t)names[k][i] << (8 * (i % 4));
+-		}
+-		addr[n] = 0;
+-		for (uint32_t h = 8; h < 8 + 16 * 8; h += 16) {
+-			uint32_t w0 = touch_rd(db, h), cnt = touch_rd(db, h + 4) >> 16, e = 144 + (w0 >> 16);
+-			for (uint32_t j = 0; (w0 & 0xffff) == 5 && j < cnt && e + 24 * j + 24 <= 0x20000; j++) {
+-				if (touch_rd(db, e + 24 * j) == key0 && touch_rd(db, e + 24 * j + 4) == key1) {
+-					addr[n] = touch_rd(db, e + 24 * j + 16);
+-				}
++	uint32_t key0 = 0, key1 = 0, addr = 0;
++	for (uint32_t i = 0; name[i] && i < 8; i++) {
++		*(i < 4 ? &key0 : &key1) |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (uint32_t h = 8; h < 8 + 16 * 8; h += 16) {
++		uint32_t w0 = touch_rd(rh8_db, h), cnt = touch_rd(rh8_db, h + 4) >> 16, e = 144 + (w0 >> 16);
++		for (uint32_t j = 0; (w0 & 0xffff) == slave && j < cnt && e + 24 * j + 24 <= 0x20000; j++) {
++			if (touch_rd(rh8_db, e + 24 * j) == key0 && touch_rd(rh8_db, e + 24 * j + 4) == key1) {
++				addr = touch_rd(rh8_db, e + 24 * j + 16);
+ 			}
+ 		}
+-		printf("ISHTAR TOUCHPROBE: bcm %s addr %#x\n", names[k], addr[n]);
+-		n += addr[n] != 0;
+ 	}
++	printf("ISHTAR TOUCHPROBE: cmd-db %s (slave %u) addr %#x\n", name, slave, addr);
++	return addr;
++}
++
++/* one ACTIVE TCS write of n (<= 16) commands, polled; apps_rsc drv-2, RSC v3 */
++static bool
++rh8_send(const uint32_t *addr, const uint32_t *data, uint32_t n)
++{
+ 	int t = -1;
+-	for (uint32_t i = 0; i < 3; i++) {
++	for (uint32_t i = 0; i < 3 && t < 0; i++) {
+ 		uint32_t b = i * 0x2a0;
+-		printf("ISHTAR TOUCHPROBE: tcs%u status %#x ctl %#x en %#x wait %#x\n", i, touch_rd(tcs, b + 0x28),
+-		    touch_rd(tcs, b + 0x24), touch_rd(tcs, b + 0x2c), touch_rd(tcs, b + 0x20));
+-		if (t < 0 && touch_rd(tcs, b + 0x28) && !touch_rd(tcs, b + 0x24) && !touch_rd(tcs, b + 0x2c)) {
++		if (touch_rd(rh8_tcs, b + 0x28) && !touch_rd(rh8_tcs, b + 0x24) && !touch_rd(rh8_tcs, b + 0x2c)) {
+ 			t = (int)i;
+ 		}
+ 	}
+ 	if (t < 0 || !n) {
+-		return;
++		return false;
+ 	}
+ 	uint32_t b = (uint32_t)t * 0x2a0, mask = (1u << n) - 1, done = 0;
+-	touch_wr(tcs, 0x0, touch_rd(tcs, 0x0) & ~(1u << t));     /* IRQ_EN: ours masked */
++	touch_wr(rh8_tcs, 0x0, touch_rd(rh8_tcs, 0x0) & ~(1u << t));     /* IRQ_EN: ours masked */
+ 	for (uint32_t c = 0; c < n; c++) {
+-		touch_wr(tcs, b + 0x34 + 24 * c, 8 | (1u << 8) | (1u << 16));            /* write, resp req, len 4 */
+-		touch_wr(tcs, b + 0x38 + 24 * c, addr[c]);
+-		touch_wr(tcs, b + 0x3c + 24 * c, (1u << 30) | (1u << 29) | (v << 14) | v);  /* commit, valid, x, y */
+-	}
+-	touch_wr(tcs, b + 0x20, mask);
+-	touch_wr(tcs, b + 0x2c, mask);
+-	touch_wr(tcs, b + 0x24, 1u << 16);
+-	touch_wr(tcs, b + 0x24, (1u << 16) | (1u << 24));
++		touch_wr(rh8_tcs, b + 0x34 + 24 * c, 8 | (1u << 8) | (1u << 16));   /* write, resp req, len 4 */
++		touch_wr(rh8_tcs, b + 0x38 + 24 * c, addr[c]);
++		touch_wr(rh8_tcs, b + 0x3c + 24 * c, data[c]);
++	}
++	touch_wr(rh8_tcs, b + 0x20, mask);
++	touch_wr(rh8_tcs, b + 0x2c, mask);
++	touch_wr(rh8_tcs, b + 0x24, 1u << 16);
++	touch_wr(rh8_tcs, b + 0x24, (1u << 16) | (1u << 24));
+ 	for (int i = 0; i < 1000 && done != mask; i++) {
+ 		done = 0;
+ 		for (uint32_t c = 0; c < n; c++) {
+-			done |= ((touch_rd(tcs, b + 0x40 + 24 * c) & 0x10100) == 0x10100) << c;
++			done |= ((touch_rd(rh8_tcs, b + 0x40 + 24 * c) & 0x10100) == 0x10100) << c;
+ 		}
+ 		delay(100);
+ 	}
+-	printf("ISHTAR TOUCHPROBE: bcm vote %u on tcs%d: done %#x/%#x status %#x irq %#x\n", v, t, done, mask,
+-	    touch_rd(tcs, b + 0x28), touch_rd(tcs, 0x4));
+-	touch_wr(tcs, b + 0x24, 0);
+-	touch_wr(tcs, b + 0x2c, 0);
+-	touch_wr(tcs, b + 0x20, 0);
+-	touch_wr(tcs, 0x8, 1u << t);
++	printf("ISHTAR TOUCHPROBE: rpmh tcs%d: done %#x/%#x status %#x\n", t, done, mask, touch_rd(rh8_tcs, b + 0x28));
++	touch_wr(rh8_tcs, b + 0x24, 0);
++	touch_wr(rh8_tcs, b + 0x2c, 0);
++	touch_wr(rh8_tcs, b + 0x20, 0);
++	touch_wr(rh8_tcs, 0x8, 1u << t);
++	return done == mask;
++}
++
++static bool
++rh8_up(void)
++{
++	if (!rh8_tcs) {
++		vm_offset_t rsc = ml_io_map(0x17a20000u, 0x4000);
++		rh8_db = ml_io_map(0x81c60000u, 0x20000);
++		if (!rsc || !rh8_db || touch_rd(rh8_db, 4) != 0x0c0330dbu || ((touch_rd(rsc, 0) >> 16) & 0xff) != 3) {
++			return false;
++		}
++		rh8_tcs = rsc + 0xd00;
++	}
++	return true;
++}
++
++/*
++ * RPMh BCM votes for the QUP2 DMA path (Linux sm8550 interconnect: QUP2 core,
++ * SN3 = aggre2 -> snoc, which carries qhm_qup2).
++ * ponytail: fixed vote of 1 unit per BCM, real bandwidth math (cmd-db aux) when needed.
++ */
++static void
++touch_bcm_votes(void)
++{
++	static const char *const names[] = { "QUP2", "SN3", "SN0", "SH0", "MC0" };
++	uint32_t addr[5], data[5], n = 0, v = 1;
++	PE_parse_boot_argn("ishtartouchbcmv", &v, sizeof(v));
++	if (!rh8_up()) {
++		return;
++	}
++	for (uint32_t k = 0; k < 5; k++) {
++		if ((addr[n] = rh8_lookup(names[k], 5))) {
++			data[n++] = (1u << 30) | (1u << 29) | (v << 14) | v;    /* commit, valid, x, y */
++		}
++	}
++	rh8_send(addr, data, n);
++}
++
++/* SPMI v7 observer read (EE 0) of one PMIC register, -1 on error; PPID = SID << 8 | periph */
++static int
++touch_spmi_rd(uint32_t ppid, uint32_t reg)
++{
++	static vm_offset_t core, obs;
++	if (!core) {
++		core = ml_io_map(0x0c400000u, 0x4000);
++		obs = ml_io_map(0x0c440000u, 0x10000);
++	}
++	for (uint32_t i = 0; core && obs && i < 512; i++) {
++		uint32_t map = touch_rd(core, 0x2000u + 4u * i);
++		if (map && ((map >> 8) & 0xfffu) == ppid) {
++			touch_wr(obs, 0x20u * i, (1u << 27) | ((reg & 0xffu) << 4));   /* EXT_READL, one byte */
++			for (int k = 0; k < 1000; k++) {
++				uint32_t st = touch_rd(obs, 0x20u * i + 8);
++				if (st & 1u) {
++					return (st & 0xeu) ? -1 : (int)(touch_rd(obs, 0x20u * i + 0x18) & 0xff);
++				}
++				delay(1);
++			}
++			return -1;
++		}
++	}
++	return -1;
++}
++
++/*
++ * Stock fts power cycle (fts.c fts_chip_power_switch) with stock regulators (HyperOS regulator_summary:
++ * spi1.0-vdd = pm_humu_l12 = L12B 1.8 V via rpmh-regulator "ldob12"; spi1.0-avdd = PM8008i L7 3.3 V):
++ * reset low, vdd on, 1 ms, avdd (stage 4), 16 ms, reset high.
++ */
++static void
++touch_power_cycle(vm_offset_t tlmm)
++{
++	vm_offset_t rst = tlmm + 117 * 0x1000u;
++	geni_w(rst, 4, 0);
++	geni_w(rst, 0, (3u << 6) | 0x200 | 3);             /* output low, 8 mA, pull-up (stock mi_ts_active_new) */
++	geni_w(tlmm + 67 * 0x1000u, 0, (3u << 6) | 3);     /* irq gpio67: input, 8 mA, pull-up */
++	printf("ISHTAR TOUCHPROBE: L12B (ppid 0x14b) before: status1 %#x en %#x vset %#x/%#x\n", touch_spmi_rd(0x14b, 0x08),
++	    touch_spmi_rd(0x14b, 0x46), touch_spmi_rd(0x14b, 0x40), touch_spmi_rd(0x14b, 0x41));
++	uint32_t a = rh8_up() ? rh8_lookup("ldob12", 4) : 0;
++	if (a) {
++		const uint32_t addr[3] = { a, a + 8, a + 4 }, data[3] = { 1800, 7, 1 };     /* mV, mode HPM, enable */
++		rh8_send(addr, data, 3);
++	}
++	delay(1000);
++	printf("ISHTAR TOUCHPROBE: L12B after vote: status1 %#x en %#x\n", touch_spmi_rd(0x14b, 0x08), touch_spmi_rd(0x14b, 0x46));
++	delay(16000);
++	geni_w(rst, 4, 2);                                 /* reset high */
++	delay(300000);
+ }
+ 
+ static int

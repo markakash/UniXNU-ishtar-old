@@ -1,0 +1,15 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index cfb53fa..f477929 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -860,6 +860,10 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) ishtar_fbcon_serial_f
+ static void
+ fbcon_probe(void)
+ {
++	/* Re-registering this static backend would link it to itself. */
++	if (fbcon_base != NULL) {
++		return;
++	}
+ 	DTEntry entry;
+ 	uint64_t const *reg;
+ 	uint32_t const *val;

@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/IshtarFramebuffer.cpp b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+index c34b2aa..2e3b1a0 100644
+--- a/iokit/Kernel/arm/IshtarFramebuffer.cpp
++++ b/iokit/Kernel/arm/IshtarFramebuffer.cpp
+@@ -3582,6 +3582,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kIshtarFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			static int keepon = -1;
++			if (keepon < 0 && !PE_parse_boot_argn("ishtarfb_keepon", &keepon, sizeof(keepon))) {
++				keepon = 0;
++			}
++			if (off && keepon) {
++				/* ishtar: no keys/touch to wake it yet, so ignore iOS's display off (ishtarfb_keepon=1) */
++				IOLog("ISHTAR FB: display off ignored (ishtarfb_keepon)\n");
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;

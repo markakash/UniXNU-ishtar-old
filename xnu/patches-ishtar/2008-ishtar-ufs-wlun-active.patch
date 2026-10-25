@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/ishtar_ufs.c b/bsd/dev/ishtar_ufs.c
+index 64f1f14..9a74d11 100644
+--- a/bsd/dev/ishtar_ufs.c
++++ b/bsd/dev/ishtar_ufs.c
+@@ -1166,9 +1166,18 @@ ishtar_ufs_init(void)
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
++		/* START STOP UNIT, POWER CONDITION = active (1): wakes a device UEFI left in sleep/power-down. */
++		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		printf("ISHTAR UFS: host taken over, TEST UNIT READY\n");
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		for (int i = 0; i < 10 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			if ((ss.last_sense >> 16) == 0x2) {     /* NOT READY: to the UFS Device W-LUN */
++				su.lun = 0xd0;
++				int rc = ufs_scsi(ssu, sizeof(ssu), 0, false);
++				su.lun = 0;
++				printf("ISHTAR UFS: device power mode active: %d\n", rc);
++			}
++			delay(10000);
+ 		}
+ 		printf("ISHTAR UFS: TUR %d\n", error);
+ 	}

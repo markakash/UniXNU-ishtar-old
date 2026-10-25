@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/ishtar_cpufreq.c b/bsd/dev/ishtar_cpufreq.c
+index 8c00b91..273b389 100644
+--- a/bsd/dev/ishtar_cpufreq.c
++++ b/bsd/dev/ishtar_cpufreq.c
+@@ -681,20 +681,21 @@ cf8_thread(__unused void *arg, __unused wait_result_t wr)
+ 				const uint64_t need = (uint64_t)cf8_khz(d, MIN(cf8_set[d], cf8_rows[d] - 1)) * load / 70;
+ 				for (w = 0; w < cap && cf8_khz(d, w) < need; w++) {
+ 				}
++				/* Reset against the requested state, before hysteresis can hold w at the current state. */
++				if (w >= cf8_set[d]) {
++					cf8_low[d] = 0;
++				}
+ 				if (w < cf8_set[d]) {          /* down: after three low samples, two states at a time */
+ 					w = ++cf8_low[d] < 3 ? cf8_set[d] : MAX(w, cf8_set[d] >= 2 ? cf8_set[d] - 2 : 0);
+ 				}
+-			}
+-			if (w >= cf8_set[d]) {
++			} else {
+ 				cf8_low[d] = 0;
+ 			}
+ 			if (w != cf8_set[d]) {
+ 				*(volatile uint32_t *)(cf8_base[d] + 0x320) = w;
+ 				__asm__ volatile ("dsb sy" ::: "memory");
+ 				cf8_set[d] = w;
+-				if (w <= cf8_set[d]) {
+-					cf8_low[d] = 0;
+-				}
++				cf8_low[d] = 0;
+ 			}
+ 		}
+ 		if (ticks % 250 == 0) {        /* every 5 s */
